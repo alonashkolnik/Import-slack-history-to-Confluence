@@ -1,0 +1,66 @@
+{
+  "name": "slack-history-import",
+  "version": "1.0.0",
+  "description": "Desktop application to import Slack channel history to Confluence",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "set ELECTRON_RUN_AS_NODE= && electron .",
+    "start:win": "start.bat",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux",
+    "pack": "electron-packager . \"Slack History Import\" --platform=win32 --arch=x64 --out=dist --overwrite"
+  },
+  "build": {
+    "appId": "com.slackhistory.import",
+    "productName": "Slack History Import",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "forceCodeSigning": false
+  },
+  "keywords": [
+    "slack",
+    "confluence",
+    "import",
+    "history"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^27.0.0",
+    "electron-builder": "^24.9.1",
+    "electron-packager": "^17.1.2"
+  }
+}

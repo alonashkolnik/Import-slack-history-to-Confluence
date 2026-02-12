@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:;">
+  <title>Slack History Import to Confluence</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>📥 Slack History Import</h1>
+      <p class="subtitle">Import Slack channel history to Confluence</p>
+    </header>
+
+    <!-- Step 1: Configuration -->
+    <section id="step-config" class="step active">
+      <div class="step-header">
+        <span class="step-number">1</span>
+        <h2>Configuration</h2>
+      </div>
+      
+      <div class="form-group">
+        <label for="parent-page-url">Parent Page URL (where to create the new page)</label>
+        <input type="url" id="parent-page-url" placeholder="https://your-domain.atlassian.net/wiki/spaces/SPACE/pages/123456/Parent+Page" />
+        <small>The new page will be created as a child of this page. Copy the full URL from your browser.</small>
+      </div>
+
+      <div class="form-group">
+        <label>Slack Export Folder</label>
+        <div class="folder-select">
+          <input type="text" id="folder-path" readonly placeholder="Select folder..." />
+          <button id="btn-select-folder" class="btn btn-secondary">Browse...</button>
+        </div>
+        <small>Select the folder containing Slack export JSON files (YYYY-MM-DD.json)</small>
+      </div>
+
+      <div class="form-group">
+        <label>Users File (optional)</label>
+        <div class="folder-select">
+          <input type="text" id="users-file-path" readonly placeholder="Select users.json file..." />
+          <button id="btn-select-users-file" class="btn btn-secondary">Browse...</button>
+        </div>
+        <small>Select the users.json file from Slack export to resolve user names</small>
+      </div>
+
+      <div id="users-info" class="info-box hidden">
+        <strong>Users loaded:</strong> <span id="users-count"></span> users
+      </div>
+
+      <div id="folder-info" class="info-box hidden">
+        <strong>Folder:</strong> <span id="folder-name"></span><br>
+        <strong>Files found:</strong> <span id="file-count"></span> JSON files
+      </div>
+
+      <button id="btn-login" class="btn btn-primary" disabled>Login to Confluence</button>
+    </section>
+
+    <!-- Step 2: Login -->
+    <section id="step-login" class="step">
+      <div class="step-header">
+        <span class="step-number">2</span>
+        <h2>Confluence Login</h2>
+      </div>
+      
+      <div class="login-status">
+        <div id="login-pending" class="status-item">
+          <span class="status-icon">⏳</span>
+          <span>Waiting for login in browser window...</span>
+        </div>
+        <div id="login-success" class="status-item hidden">
+          <span class="status-icon">✅</span>
+          <span>Logged in successfully!</span>
+        </div>
+      </div>
+
+      <p class="help-text">A browser window will open. Please log in to Confluence. Once logged in, navigate to any Confluence page to confirm.</p>
+    </section>
+
+    <!-- Step 3: Import -->
+    <section id="step-import" class="step">
+      <div class="step-header">
+        <span class="step-number">3</span>
+        <h2>Import</h2>
+      </div>
+
+      <div id="import-summary" class="info-box">
+        <strong>Ready to import:</strong><br>
+        <span id="summary-channel"></span><br>
+        <span id="summary-files"></span><br>
+        <span id="summary-destination"></span>
+      </div>
+
+      <button id="btn-import" class="btn btn-primary">Start Import</button>
+
+      <div id="import-progress" class="progress-container hidden">
+        <div class="progress-bar">
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+        <p id="progress-text">Preparing...</p>
+      </div>
+    </section>
+
+    <!-- Step 4: Complete -->
+    <section id="step-complete" class="step">
+      <div class="step-header">
+        <span class="step-number">4</span>
+        <h2>Complete</h2>
+      </div>
+
+      <div class="success-box">
+        <span class="success-icon">🎉</span>
+        <h3>Import Successful!</h3>
+        <p>Your Slack channel history has been imported to Confluence.</p>
+        <a id="page-link" href="#" target="_blank" class="btn btn-primary">Open Created Page</a>
+      </div>
+
+      <button id="btn-restart" class="btn btn-secondary">Import Another Channel</button>
+    </section>
+
+    <!-- Error display -->
+    <div id="error-container" class="error-box hidden">
+      <strong>Error:</strong> <span id="error-message"></span>
+      <button id="btn-dismiss-error" class="btn-close">×</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
