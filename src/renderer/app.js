@@ -291,79 +291,148 @@ async function handleImport() {
   }
 }
 
-// Import a single channel
+// ==================== Monthly Page Utilities ====================
+
+// Group slackData (array of { dateName, messages }) by month key "YYYY-MM"
+function groupByMonth(slackData) {
+  const months = new Map(); // key: "YYYY-MM", value: [dayData, ...]
+  for (const dayData of slackData) {
+    // dateName is like "2026-01-05"
+    const monthKey = dayData.dateName.substring(0, 7); // "2026-01"
+    if (!months.has(monthKey)) {
+      months.set(monthKey, []);
+    }
+    months.get(monthKey).push(dayData);
+  }
+  // Return sorted by month key
+  return new Map([...months.entries()].sort((a, b) => a[0].localeCompare(b[0])));
+}
+
+// Format month key "2026-01" to human-readable "January 2026"
+function formatMonthLabel(monthKey) {
+  const [year, month] = monthKey.split('-');
+  const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'];
+  return `${monthNames[parseInt(month, 10) - 1]} ${year}`;
+}
+
+// Build the monthly page title: "<channelName> - January 2026"
+function buildMonthlyPageTitle(channelName, monthKey) {
+  return `${channelName} - ${formatMonthLabel(monthKey)}`;
+}
+
+// Build channel parent page content with children macro
+function buildChannelParentContent(channelName) {
+  let html = `<h1>Slack Channel: ${escapeHtml(channelName)}</h1>\n`;
+  html += `<p><em>Imported on ${new Date().toLocaleString()}</em></p>\n`;
+  html += '<p>Monthly history pages are listed below:</p>\n';
+  html += '<ac:structured-macro ac:name="children"><ac:parameter ac:name="sort">title</ac:parameter><ac:parameter ac:name="all">true</ac:parameter></ac:structured-macro>\n';
+  return html;
+}
+
+// Build navigation links for a monthly page
+function buildNavLinks(channelName, prevMonthKey, nextMonthKey) {
+  let html = '<div style="display: flex; justify-content: space-between; padding: 8px 0; border-top: 1px solid #dfe1e6; border-bottom: 1px solid #dfe1e6; margin: 12px 0;">';
+  if (prevMonthKey) {
+    const prevTitle = buildMonthlyPageTitle(channelName, prevMonthKey);
+    html += `<ac:link><ri:page ri:content-title="${escapeHtml(prevTitle)}" /><ac:plain-text-link-body><![CDATA[⬅ ${formatMonthLabel(prevMonthKey)}]]></ac:plain-text-link-body></ac:link>`;
+  } else {
+    html += '<span></span>';
+  }
+  if (nextMonthKey) {
+    const nextTitle = buildMonthlyPageTitle(channelName, nextMonthKey);
+    html += `<ac:link><ri:page ri:content-title="${escapeHtml(nextTitle)}" /><ac:plain-text-link-body><![CDATA[${formatMonthLabel(nextMonthKey)} ➡]]></ac:plain-text-link-body></ac:link>`;
+  } else {
+    html += '<span></span>';
+  }
+  html += '</div>\n';
+  return html;
+}
+
+// Build content for a single monthly page
+function buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey) {
+  let html = `<h1>${escapeHtml(channelName)} - ${escapeHtml(formatMonthLabel(monthKey))}</h1>\n`;
+  html += `<p><em>Imported on ${new Date().toLocaleString()}</em></p>\n`;
+
+  // Navigation at top
+  html += buildNavLinks(channelName, prevMonthKey, nextMonthKey);
+
+  for (const dayData of monthData) {
+    html += `<h2>📅 ${escapeHtml(dayData.dateName)}</h2>\n`;
+    html += '<hr/>\n';
+
+    const messages = dayData.messages;
+    const threads = new Map();
+    const mainMessages = [];
+
+    for (const msg of messages) {
+      if (msg.thread_ts && msg.thread_ts !== msg.ts) {
+        if (!threads.has(msg.thread_ts)) {
+          threads.set(msg.thread_ts, []);
+        }
+        threads.get(msg.thread_ts).push(msg);
+      } else {
+        mainMessages.push(msg);
+      }
+    }
+
+    for (const msg of mainMessages) {
+      html += renderMessage(msg);
+
+      if (msg.ts && threads.has(msg.ts)) {
+        const replies = threads.get(msg.ts);
+        html += `<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">💬 Thread replies (${replies.length})</ac:parameter><ac:rich-text-body>\n`;
+        for (const reply of replies) {
+          html += renderMessage(reply, true);
+        }
+        html += '</ac:rich-text-body></ac:structured-macro>\n';
+      }
+    }
+  }
+
+  // Navigation at bottom
+  html += buildNavLinks(channelName, prevMonthKey, nextMonthKey);
+
+  return html;
+}
+
+// ==================== Import Logic ====================
+
+// Import a single channel (monthly pages)
 async function importSingleChannel() {
-  updateProgress(10, 'Building page content...');
-  const pageContent = buildConfluenceContent(state.slackData);
-
-  updateProgress(30, 'Creating Confluence page...');
-  
-  const result = await createConfluencePage(
-    state.folderName,
-    pageContent,
-    state.spaceKey,
-    state.parentPageId
-  );
-
-  if (!result.success) {
-    throw new Error(result.error);
-  }
-
-  updateProgress(100, result.message || 'Complete!');
-
-  // Show success with message
-  elements.pageLink.href = result.pageUrl;
-  
-  // Update success message based on result
-  const successMessage = document.querySelector('.success-box p');
-  if (successMessage && result.message) {
-    successMessage.textContent = result.message;
-  }
-  
+  updateProgress(5, 'Grouping messages by month...');
+  await importChannelWithMonthlyPages(state.folderName, state.slackData, state.spaceKey, state.parentPageId, 5, 95);
   showStep('complete');
 }
 
-// Import multiple channels
+// Import multiple channels (each with monthly pages)
 async function importMultipleChannels() {
   const totalChannels = state.channels.length;
   const results = [];
-  
+
   for (let i = 0; i < totalChannels; i++) {
     const channel = state.channels[i];
-    const progressPercent = Math.round((i / totalChannels) * 90) + 5;
-    
-    updateProgress(progressPercent, `Importing channel ${i + 1}/${totalChannels}: ${channel.channelName}...`);
-    
-    // Build content for this channel
-    const pageContent = buildConfluenceContentForChannel(channel.channelName, channel.data);
-    
-    // Create/update page for this channel
-    const result = await createConfluencePageForChannel(
-      channel.channelName,
-      pageContent,
-      channel.data,
-      state.spaceKey,
-      state.parentPageId
-    );
-    
-    results.push({
-      channelName: channel.channelName,
-      success: result.success,
-      message: result.message || result.error
-    });
+    const progressStart = Math.round((i / totalChannels) * 90) + 5;
+    const progressEnd = Math.round(((i + 1) / totalChannels) * 90) + 5;
+
+    updateProgress(progressStart, `Importing channel ${i + 1}/${totalChannels}: ${channel.channelName}...`);
+
+    try {
+      await importChannelWithMonthlyPages(channel.channelName, channel.data, state.spaceKey, state.parentPageId, progressStart, progressEnd);
+      results.push({ channelName: channel.channelName, success: true });
+    } catch (error) {
+      results.push({ channelName: channel.channelName, success: false, message: error.message });
+    }
   }
-  
-  // Count successes and failures
+
   const successes = results.filter(r => r.success).length;
   const failures = results.filter(r => !r.success).length;
-  
+
   updateProgress(100, `Complete! ${successes} channels imported, ${failures} failed`);
-  
-  // For multi-channel, link to parent page
+
   const parentPageUrl = `${state.baseUrl}/wiki/spaces/${state.spaceKey}/pages/${state.parentPageId}`;
   elements.pageLink.href = parentPageUrl;
-  
-  // Update success message
+
   const successMessage = document.querySelector('.success-box p');
   if (successMessage) {
     if (failures > 0) {
@@ -372,117 +441,185 @@ async function importMultipleChannels() {
       successMessage.textContent = `Successfully imported all ${successes} channels!`;
     }
   }
-  
+
   showStep('complete');
 }
 
-// Build Confluence content for a specific channel (used in multi-channel mode)
-function buildConfluenceContentForChannel(channelName, slackData) {
-  let html = `<h1>Slack Channel: ${escapeHtml(channelName)}</h1>\n`;
-  html += `<p><em>Imported on ${new Date().toLocaleString()}</em></p>\n`;
-  html += '<hr/>\n';
+// Core: import a single channel as parent page + monthly child pages
+async function importChannelWithMonthlyPages(channelName, slackData, spaceKey, parentPageId, progressStart, progressEnd) {
+  const monthsMap = groupByMonth(slackData);
+  const monthKeys = Array.from(monthsMap.keys()); // sorted
+  const totalMonths = monthKeys.length;
 
-  for (const dayData of slackData) {
-    html += `<h2>📅 ${escapeHtml(dayData.dateName)}</h2>\n`;
-    html += '<hr/>\n';
+  // Step 1: Resolve space key from parent page
+  const spaceKeyResolved = await resolveSpaceKey(spaceKey, parentPageId);
+  if (!spaceKeyResolved) {
+    throw new Error('Could not determine space key from parent page');
+  }
 
-    const messages = dayData.messages;
-    const threads = new Map();
-    const mainMessages = [];
+  // Step 2: Create or find the channel parent page
+  const channelParentContent = buildChannelParentContent(channelName);
+  const channelPage = await findOrCreatePage(channelName, channelParentContent, spaceKeyResolved, parentPageId);
+  if (!channelPage.success) {
+    throw new Error(channelPage.error);
+  }
 
-    for (const msg of messages) {
-      if (msg.thread_ts && msg.thread_ts !== msg.ts) {
-        if (!threads.has(msg.thread_ts)) {
-          threads.set(msg.thread_ts, []);
+  const channelPageId = channelPage.pageId;
+  const channelPageUrl = channelPage.pageUrl;
+
+  // Set link for single-channel mode
+  elements.pageLink.href = channelPageUrl;
+
+  // Step 3: Create monthly child pages
+  let createdCount = 0;
+  let skippedCount = 0;
+
+  for (let i = 0; i < totalMonths; i++) {
+    const monthKey = monthKeys[i];
+    const prevMonthKey = i > 0 ? monthKeys[i - 1] : null;
+    const nextMonthKey = i < totalMonths - 1 ? monthKeys[i + 1] : null;
+
+    const progress = progressStart + ((i / totalMonths) * (progressEnd - progressStart));
+    updateProgress(Math.round(progress), `Creating page for ${formatMonthLabel(monthKey)} (${i + 1}/${totalMonths})...`);
+
+    const monthTitle = buildMonthlyPageTitle(channelName, monthKey);
+    const monthData = monthsMap.get(monthKey);
+    const monthContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
+
+    // Check if monthly page already exists
+    const existingMonthPage = await findExistingPage(monthTitle, spaceKeyResolved, channelPageId);
+
+    if (existingMonthPage) {
+      // Incremental: check for new dates in this month
+      const existingDates = extractExistingDates(existingMonthPage.content);
+      const { html: newContent, newDatesCount } = buildIncrementalContent(monthData, existingDates);
+
+      if (newDatesCount === 0) {
+        skippedCount++;
+        console.log(`Month ${monthTitle} is up to date, skipping.`);
+
+        // Still update nav links if neighbors changed
+        const needsNavUpdate = checkNavLinksNeedUpdate(existingMonthPage.content, channelName, prevMonthKey, nextMonthKey);
+        if (needsNavUpdate) {
+          const updatedFullContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
+          await updatePageContent(existingMonthPage.id, monthTitle, updatedFullContent, existingMonthPage.version);
         }
-        threads.get(msg.thread_ts).push(msg);
-      } else {
-        mainMessages.push(msg);
+        continue;
       }
-    }
 
-    for (const msg of mainMessages) {
-      html += renderMessage(msg);
-
-      if (msg.ts && threads.has(msg.ts)) {
-        const replies = threads.get(msg.ts);
-        html += `<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">💬 Thread replies (${replies.length})</ac:parameter><ac:rich-text-body>\n`;
-        for (const reply of replies) {
-          html += renderMessage(reply, true);
-        }
-        html += '</ac:rich-text-body></ac:structured-macro>\n';
+      // Rebuild the full monthly page with all dates (simpler than appending)
+      const updatedFullContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
+      const updateResult = await updatePageContent(existingMonthPage.id, monthTitle, updatedFullContent, existingMonthPage.version);
+      if (updateResult.success) {
+        createdCount++;
+      }
+    } else {
+      // Create new monthly page
+      const createResult = await createNewPage(monthTitle, monthContent, spaceKeyResolved, channelPageId);
+      if (createResult.success) {
+        createdCount++;
+      } else {
+        console.error(`Failed to create page ${monthTitle}:`, createResult.error);
       }
     }
   }
 
-  return html;
+  updateProgress(progressEnd, `${channelName}: ${createdCount} month(s) created/updated, ${skippedCount} up to date`);
+
+  const successMessage = document.querySelector('.success-box p');
+  if (successMessage) {
+    successMessage.textContent = `Imported ${channelName}: ${createdCount} month page(s) created/updated, ${skippedCount} already up to date.`;
+  }
 }
 
-// Create Confluence page for a channel (handles existing page check)
-async function createConfluencePageForChannel(channelName, content, slackData, spaceKey, parentPageId) {
-  // Temporarily set state for the channel being processed
-  const originalFolderName = state.folderName;
-  const originalSlackData = state.slackData;
-  
-  state.folderName = channelName;
-  state.slackData = slackData;
-  
-  try {
-    const result = await createConfluencePage(channelName, content, spaceKey, parentPageId);
-    return result;
-  } finally {
-    // Restore original state
-    state.folderName = originalFolderName;
-    state.slackData = originalSlackData;
+// Check if navigation links need updating (e.g., a new month was added)
+function checkNavLinksNeedUpdate(existingContent, channelName, prevMonthKey, nextMonthKey) {
+  if (prevMonthKey) {
+    const prevTitle = buildMonthlyPageTitle(channelName, prevMonthKey);
+    if (!existingContent.includes(prevTitle)) return true;
   }
+  if (nextMonthKey) {
+    const nextTitle = buildMonthlyPageTitle(channelName, nextMonthKey);
+    if (!existingContent.includes(nextTitle)) return true;
+  }
+  return false;
 }
 
-// Build Confluence storage format content from Slack data
-function buildConfluenceContent(slackData) {
-  let html = `<h1>Slack Channel: ${escapeHtml(state.folderName)}</h1>\n`;
-  html += `<p><em>Imported on ${new Date().toLocaleString()}</em></p>\n`;
-  html += '<hr/>\n';
+// ==================== Confluence API Helpers ====================
 
-  for (const dayData of slackData) {
-    // Add date header
-    html += `<h2>📅 ${escapeHtml(dayData.dateName)}</h2>\n`;
-    html += '<hr/>\n';
+// Resolve space key from parent page
+async function resolveSpaceKey(spaceKey, parentPageId) {
+  const apiUrl = `${state.baseUrl}/wiki/rest/api/content/${parentPageId}?expand=space`;
+  const response = await window.electronAPI.confluenceApiRequest({ method: 'GET', url: apiUrl });
+  if (!response.ok) return spaceKey;
+  return response.data.space?.key || spaceKey;
+}
 
-    // Process messages for this day
-    const messages = dayData.messages;
-    
-    // Group messages by thread
-    const threads = new Map();
-    const mainMessages = [];
+// Find or create a page (returns { success, pageId, pageUrl, error })
+async function findOrCreatePage(title, content, spaceKey, parentPageId) {
+  const existing = await findExistingPage(title, spaceKey, parentPageId);
+  if (existing) {
+    const pageUrl = `${state.baseUrl}/wiki/spaces/${spaceKey}/pages/${existing.id}`;
+    return { success: true, pageId: existing.id, pageUrl };
+  }
+  return await createNewPage(title, content, spaceKey, parentPageId);
+}
 
-    for (const msg of messages) {
-      if (msg.thread_ts && msg.thread_ts !== msg.ts) {
-        if (!threads.has(msg.thread_ts)) {
-          threads.set(msg.thread_ts, []);
-        }
-        threads.get(msg.thread_ts).push(msg);
-      } else {
-        mainMessages.push(msg);
+// Create a new Confluence page
+async function createNewPage(title, content, spaceKey, parentPageId) {
+  const createBody = {
+    type: 'page',
+    title: title,
+    space: { key: spaceKey },
+    ancestors: [{ id: parentPageId }],
+    body: {
+      storage: {
+        value: content,
+        representation: 'storage'
       }
     }
+  };
 
-    // Render messages
-    for (const msg of mainMessages) {
-      html += renderMessage(msg);
+  const response = await window.electronAPI.confluenceApiRequest({
+    method: 'POST',
+    url: `${state.baseUrl}/wiki/rest/api/content`,
+    body: createBody
+  });
 
-      // Render thread replies if any
-      if (msg.ts && threads.has(msg.ts)) {
-        const replies = threads.get(msg.ts);
-        html += `<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">💬 Thread replies (${replies.length})</ac:parameter><ac:rich-text-body>\n`;
-        for (const reply of replies) {
-          html += renderMessage(reply, true);
-        }
-        html += '</ac:rich-text-body></ac:structured-macro>\n';
-      }
-    }
+  if (!response.ok) {
+    return { success: false, error: `Failed to create page "${title}": ${response.status} - ${JSON.stringify(response.data)}` };
   }
 
-  return html;
+  const page = response.data;
+  const pageUrl = `${state.baseUrl}/wiki${page._links?.webui || `/spaces/${spaceKey}/pages/${page.id}`}`;
+  return { success: true, pageId: page.id, pageUrl };
+}
+
+// Update an existing Confluence page
+async function updatePageContent(pageId, title, content, currentVersion) {
+  const updateBody = {
+    version: { number: currentVersion + 1 },
+    title: title,
+    type: 'page',
+    body: {
+      storage: {
+        value: content,
+        representation: 'storage'
+      }
+    }
+  };
+
+  const response = await window.electronAPI.confluenceApiRequest({
+    method: 'PUT',
+    url: `${state.baseUrl}/wiki/rest/api/content/${pageId}`,
+    body: updateBody
+  });
+
+  if (!response.ok) {
+    return { success: false, error: `Failed to update page: ${response.status} - ${JSON.stringify(response.data)}` };
+  }
+
+  return { success: true };
 }
 
 // Resolve user ID to display name using userMap
@@ -802,138 +939,6 @@ function buildIncrementalContent(slackData, existingDates) {
   }
 
   return { html, newDatesCount };
-}
-
-// Create Confluence page via REST API (using main process to avoid CORS)
-async function createConfluencePage(title, content, spaceKey, parentPageId) {
-  try {
-    // Use REST API v1 to get parent page info (more reliable with session auth)
-    const apiUrl = `${state.baseUrl}/wiki/rest/api/content/${parentPageId}?expand=space`;
-    console.log('Creating page with:', { title, spaceKey, parentPageId, baseUrl: state.baseUrl });
-    console.log('API URL for parent page:', apiUrl);
-    
-    // Show debug info to user
-    updateProgress(10, `Fetching parent page info...`);
-    
-    // First, get the parent page info to find the space key
-    const parentPageResponse = await window.electronAPI.confluenceApiRequest({
-      method: 'GET',
-      url: apiUrl
-    });
-    
-    console.log('Parent page response:', parentPageResponse);
-
-    if (!parentPageResponse.ok) {
-      return { success: false, error: `Failed to get parent page info: ${parentPageResponse.status} - ${parentPageResponse.error || JSON.stringify(parentPageResponse.data)}` };
-    }
-
-    const parentPage = parentPageResponse.data;
-    const spaceKeyFromPage = parentPage.space?.key || spaceKey;
-    
-    if (!spaceKeyFromPage) {
-      return { success: false, error: `Could not determine space key from parent page` };
-    }
-    
-    console.log('Found space key:', spaceKeyFromPage);
-    
-    // Check if page already exists
-    updateProgress(20, `Checking for existing page "${title}"...`);
-    const existingPage = await findExistingPage(title, spaceKeyFromPage, parentPageId);
-    
-    if (existingPage) {
-      console.log('Found existing page:', existingPage.id);
-      updateProgress(30, `Page exists! Checking for new dates...`);
-      
-      // Extract existing dates from the page
-      const existingDates = extractExistingDates(existingPage.content);
-      
-      // Build content for only new dates
-      const { html: newContent, newDatesCount } = buildIncrementalContent(state.slackData, existingDates);
-      
-      if (newDatesCount === 0) {
-        return { 
-          success: true, 
-          pageId: existingPage.id, 
-          pageUrl: `${state.baseUrl}/wiki/spaces/${spaceKeyFromPage}/pages/${existingPage.id}`,
-          message: 'No new dates to import - page is already up to date!'
-        };
-      }
-      
-      updateProgress(50, `Appending ${newDatesCount} new date(s) to existing page...`);
-      
-      // Append new content to existing page
-      const updatedContent = existingPage.content + '\n' + newContent;
-      
-      const updateBody = {
-        version: { number: existingPage.version + 1 },
-        title: title,
-        type: 'page',
-        body: {
-          storage: {
-            value: updatedContent,
-            representation: 'storage'
-          }
-        }
-      };
-      
-      const updateResponse = await window.electronAPI.confluenceApiRequest({
-        method: 'PUT',
-        url: `${state.baseUrl}/wiki/rest/api/content/${existingPage.id}`,
-        body: updateBody
-      });
-      
-      if (!updateResponse.ok) {
-        const errorText = JSON.stringify(updateResponse.data);
-        return { success: false, error: `Failed to update page: ${updateResponse.status} - ${errorText}` };
-      }
-      
-      const updatedPage = updateResponse.data;
-      const pageUrl = `${state.baseUrl}/wiki${updatedPage._links?.webui || `/spaces/${spaceKeyFromPage}/pages/${updatedPage.id}`}`;
-      
-      return { 
-        success: true, 
-        pageId: updatedPage.id, 
-        pageUrl: pageUrl,
-        message: `Updated existing page with ${newDatesCount} new date(s)`
-      };
-    }
-    
-    // Page doesn't exist - create new one
-    updateProgress(40, `Creating new page in space ${spaceKeyFromPage}...`);
-
-    // Create the page using REST API v1 (works better with session auth)
-    const createBody = {
-      type: 'page',
-      title: title,
-      space: { key: spaceKeyFromPage },
-      ancestors: [{ id: parentPageId }],
-      body: {
-        storage: {
-          value: content,
-          representation: 'storage'
-        }
-      }
-    };
-
-    const createResponse = await window.electronAPI.confluenceApiRequest({
-      method: 'POST',
-      url: `${state.baseUrl}/wiki/rest/api/content`,
-      body: createBody
-    });
-
-    if (!createResponse.ok) {
-      const errorText = JSON.stringify(createResponse.data);
-      return { success: false, error: `Failed to create page: ${createResponse.status} - ${errorText}` };
-    }
-
-    const newPage = createResponse.data;
-    const pageUrl = `${state.baseUrl}/wiki${newPage._links?.webui || `/spaces/${spaceKeyFromPage}/pages/${newPage.id}`}`;
-
-    return { success: true, pageId: newPage.id, pageUrl: pageUrl, message: 'Created new page' };
-
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
 }
 
 // Emoji mapping (subset - same as in the macro)
