@@ -112,21 +112,19 @@ async function handleSelectFolder() {
         channelName: result.folderName,
         folderPath: result.folderPath,
         fileCount: result.fileCount,
-        messageCount: result.messageCount || 0,
         dateNames: result.dateNames
       }];
       
       elements.folderName.textContent = result.folderName;
-      elements.fileCount.textContent = `${result.fileCount} daily files, ${(result.messageCount || 0).toLocaleString()} messages (single channel)`;
+      elements.fileCount.textContent = `${result.fileCount} daily files (single channel)`;
     } else {
       // Multi-channel: metadata only
       state.channels = result.channels;
       
       const totalFiles = result.channels.reduce((sum, ch) => sum + ch.fileCount, 0);
-      const totalMessages = result.channels.reduce((sum, ch) => sum + (ch.messageCount || 0), 0);
       
       elements.folderName.textContent = result.folderName;
-      elements.fileCount.textContent = `${result.channels.length} channels, ${totalFiles} daily files, ${totalMessages.toLocaleString()} messages`;
+      elements.fileCount.textContent = `${result.channels.length} channels, ${totalFiles} daily files`;
     }
     
     elements.folderInfo.classList.remove('hidden');
@@ -272,13 +270,12 @@ function handleLoginComplete(data) {
 // Prepare import summary
 function prepareImport() {
   const totalFiles = state.channels.reduce((sum, ch) => sum + ch.fileCount, 0);
-  const totalMessages = state.channels.reduce((sum, ch) => sum + (ch.messageCount || 0), 0);
   if (state.channels.length === 1) {
     elements.summaryChannel.textContent = `Channel: ${state.channels[0].channelName}`;
-    elements.summaryFiles.textContent = `${totalFiles} daily files, ${totalMessages.toLocaleString()} messages`;
+    elements.summaryFiles.textContent = `${totalFiles} daily files`;
   } else {
     elements.summaryChannel.textContent = `Multi-channel import: ${state.channels.length} channels`;
-    elements.summaryFiles.textContent = `${totalFiles} daily files, ${totalMessages.toLocaleString()} messages total`;
+    elements.summaryFiles.textContent = `${totalFiles} daily files total`;
   }
   elements.summaryDestination.innerHTML = `Parent Page ID: <strong>${state.parentPageId}</strong><br>Base URL: ${state.baseUrl}`;
 }
@@ -358,20 +355,145 @@ function buildImportResultsList(results) {
 
   for (const r of results) {
     const item = document.createElement('div');
-    const statusClass = r.success ? 'success' : 'error';
-    const icon = r.success ? '\u2705' : '\u274C';
-    const detail = r.success ? (r.summary || 'Done') : 'Failed';
-    const errorHtml = r.message ? `<div class="channel-error-msg">${escapeHtml(r.message)}</div>` : '';
 
-    item.className = `channel-item ${statusClass}`;
-    item.innerHTML = `
-      <span class="channel-status-icon">${icon}</span>
-      <span class="channel-name">${escapeHtml(r.channelName)}</span>
-      <span class="channel-detail">${escapeHtml(detail)}</span>
-      ${errorHtml}
-    `;
-    list.appendChild(item);
+    if (r.existedElsewhere) {
+      // "Exists elsewhere" — show link + Update/Skip buttons
+      item.className = 'channel-item elsewhere';
+      item.setAttribute('data-channel', r.channelName);
+      item.innerHTML = `
+        <span class="channel-status-icon">\u26A0\uFE0F</span>
+        <div class="channel-elsewhere-info">
+          <span class="channel-name">${escapeHtml(r.channelName)}</span>
+          <div class="channel-elsewhere-detail">
+            Page already exists elsewhere:
+            <a href="${escapeHtml(r.elsewherePageUrl)}" target="_blank" class="elsewhere-link">${escapeHtml(r.elsewherePageUrl)}</a>
+          </div>
+          <div class="channel-elsewhere-actions">
+            <button class="btn btn-small btn-primary btn-update-elsewhere" data-channel="${escapeHtml(r.channelName)}">Update this page</button>
+            <button class="btn btn-small btn-secondary btn-skip-elsewhere" data-channel="${escapeHtml(r.channelName)}">Skip</button>
+          </div>
+        </div>
+      `;
+      list.appendChild(item);
+
+      // Attach button handlers
+      item.querySelector('.btn-update-elsewhere').addEventListener('click', () => handleUpdateElsewhere(r));
+      item.querySelector('.btn-skip-elsewhere').addEventListener('click', () => handleSkipElsewhere(r.channelName));
+    } else {
+      const statusClass = r.success ? 'success' : 'error';
+      const icon = r.success ? '\u2705' : '\u274C';
+      const detail = r.success ? (r.summary || 'Done') : 'Failed';
+      const errorHtml = r.message ? `<div class="channel-error-msg">${escapeHtml(r.message)}</div>` : '';
+
+      item.className = `channel-item ${statusClass}`;
+      item.innerHTML = `
+        <span class="channel-status-icon">${icon}</span>
+        <span class="channel-name">${escapeHtml(r.channelName)}</span>
+        <span class="channel-detail">${escapeHtml(detail)}</span>
+        ${errorHtml}
+      `;
+      list.appendChild(item);
+    }
   }
+}
+
+// Handle user clicking "Update this page" for a channel that exists elsewhere
+async function handleUpdateElsewhere(r) {
+  const item = elements.importResultsList.querySelector(`[data-channel="${r.channelName}"]`);
+  if (!item) return;
+
+  // Replace buttons with spinner
+  const actionsDiv = item.querySelector('.channel-elsewhere-actions');
+  actionsDiv.innerHTML = '<div class="spinner"></div> Importing...';
+
+  try {
+    const spaceKey = state.lastSpaceKey;
+    // Import using the elsewhere page as the channel parent
+    const importResult = await importChannelMonthlyPagesInto(
+      r.channelName, r.slackData, spaceKey, r.elsewherePageId
+    );
+
+    item.className = 'channel-item success';
+    item.innerHTML = `
+      <span class="channel-status-icon">\u2705</span>
+      <span class="channel-name">${escapeHtml(r.channelName)}</span>
+      <span class="channel-detail">${escapeHtml(importResult.summary)}</span>
+    `;
+  } catch (error) {
+    item.className = 'channel-item error';
+    item.innerHTML = `
+      <span class="channel-status-icon">\u274C</span>
+      <span class="channel-name">${escapeHtml(r.channelName)}</span>
+      <span class="channel-detail">Failed</span>
+      <div class="channel-error-msg">${escapeHtml(error.message)}</div>
+    `;
+  }
+}
+
+// Handle user clicking "Skip" for a channel that exists elsewhere
+function handleSkipElsewhere(channelName) {
+  const item = elements.importResultsList.querySelector(`[data-channel="${channelName}"]`);
+  if (!item) return;
+
+  item.className = 'channel-item pending';
+  item.innerHTML = `
+    <span class="channel-status-icon">\u23ED\uFE0F</span>
+    <span class="channel-name">${escapeHtml(channelName)}</span>
+    <span class="channel-detail">Skipped by user</span>
+  `;
+}
+
+// Import monthly pages into an existing channel parent page (used for "elsewhere" resolution)
+async function importChannelMonthlyPagesInto(channelName, slackData, spaceKey, channelPageId) {
+  const monthsMap = groupByMonth(slackData);
+  const monthKeys = Array.from(monthsMap.keys());
+  const totalMonths = monthKeys.length;
+
+  let createdCount = 0;
+  let skippedCount = 0;
+  let elsewhereCount = 0;
+
+  for (let i = 0; i < totalMonths; i++) {
+    const monthKey = monthKeys[i];
+    const prevMonthKey = i > 0 ? monthKeys[i - 1] : null;
+    const nextMonthKey = i < totalMonths - 1 ? monthKeys[i + 1] : null;
+
+    const monthTitle = buildMonthlyPageTitle(channelName, monthKey);
+    const monthData = monthsMap.get(monthKey);
+    const monthContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
+
+    const existingMonthPage = await findExistingPage(monthTitle, spaceKey, channelPageId);
+
+    if (existingMonthPage) {
+      const existingDates = extractExistingDates(existingMonthPage.content);
+      const { newDatesCount } = buildIncrementalContent(monthData, existingDates);
+
+      if (newDatesCount === 0) {
+        skippedCount++;
+        const needsNavUpdate = checkNavLinksNeedUpdate(existingMonthPage.content, channelName, prevMonthKey, nextMonthKey);
+        if (needsNavUpdate) {
+          const updatedFullContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
+          await updatePageContent(existingMonthPage.id, monthTitle, updatedFullContent, existingMonthPage.version);
+        }
+        continue;
+      }
+
+      const updatedFullContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
+      const updateResult = await updatePageContent(existingMonthPage.id, monthTitle, updatedFullContent, existingMonthPage.version);
+      if (updateResult.success) createdCount++;
+    } else {
+      const createResult = await createNewPage(monthTitle, monthContent, spaceKey, channelPageId);
+      if (createResult.success) {
+        createdCount++;
+      } else if (createResult.existsElsewhere) {
+        elsewhereCount++;
+      }
+    }
+  }
+
+  let summary = `${createdCount} month(s) created/updated, ${skippedCount} up to date`;
+  if (elsewhereCount > 0) summary += `, ${elsewhereCount} skipped (exist elsewhere)`;
+  return { summary };
 }
 
 // ==================== Monthly Page Utilities ====================
@@ -515,29 +637,53 @@ async function importAllChannels() {
         channel.channelName, slackData, spaceKeyResolved, state.parentPageId, progressStart, progressEnd
       );
 
-      updateChannelStatus(channel.channelName, 'success', importResult.summary);
-      results.push({ channelName: channel.channelName, success: true, summary: importResult.summary });
+      if (importResult.existedElsewhere) {
+        // Channel page exists elsewhere — needs user decision
+        updateChannelStatus(channel.channelName, 'pending', 'Exists elsewhere — awaiting your decision');
+        results.push({
+          channelName: channel.channelName,
+          success: true,
+          summary: importResult.summary,
+          existedElsewhere: true,
+          elsewherePageId: importResult.elsewherePageId,
+          elsewherePageUrl: importResult.elsewherePageUrl,
+          folderPath: channel.folderPath,
+          slackData: slackData
+        });
+      } else {
+        updateChannelStatus(channel.channelName, 'success', importResult.summary);
+        results.push({ channelName: channel.channelName, success: true, summary: importResult.summary });
+      }
     } catch (error) {
       updateChannelStatus(channel.channelName, 'error', 'Failed', error.message);
       results.push({ channelName: channel.channelName, success: false, message: error.message });
     }
   }
 
-  const successes = results.filter(r => r.success).length;
+  // Store for use by completion screen
+  state.lastImportResults = results;
+  state.lastSpaceKey = spaceKeyResolved;
+
+  const successes = results.filter(r => r.success && !r.existedElsewhere).length;
+  const elsewhere = results.filter(r => r.existedElsewhere).length;
   const failures = results.filter(r => !r.success).length;
 
-  updateProgress(100, `Complete! ${successes} channels imported, ${failures} failed`);
+  let statusMsg = `${successes} channels imported`;
+  if (elsewhere > 0) statusMsg += `, ${elsewhere} need your decision`;
+  if (failures > 0) statusMsg += `, ${failures} failed`;
+  updateProgress(100, statusMsg);
 
   const parentPageUrl = `${state.baseUrl}/wiki/spaces/${spaceKeyResolved}/pages/${state.parentPageId}`;
   elements.pageLink.href = parentPageUrl;
 
   const successMessage = document.querySelector('.success-box p');
   if (successMessage) {
-    if (failures > 0) {
-      successMessage.innerHTML = `Imported ${successes} channels successfully.<br>${failures} channels had errors.`;
-    } else {
-      successMessage.textContent = `Successfully imported all ${successes} channels!`;
-    }
+    let msg = '';
+    if (successes > 0) msg += `${successes} channels imported successfully.`;
+    if (elsewhere > 0) msg += `${msg ? '<br>' : ''}${elsewhere} channels found elsewhere in space — please decide below.`;
+    if (failures > 0) msg += `${msg ? '<br>' : ''}${failures} channels had errors.`;
+    if (!msg) msg = 'Import complete.';
+    successMessage.innerHTML = msg;
   }
 
   // Build results list on completion screen
@@ -560,9 +706,14 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
     throw new Error(channelPage.error);
   }
 
-  // If channel parent page exists elsewhere (not under our parent), skip the whole channel
+  // If channel parent page exists elsewhere (not under our parent), return for user decision
   if (channelPage.existedElsewhere) {
-    return { summary: `Skipped \u2014 page "${channelName}" already exists elsewhere in the space` };
+    return {
+      summary: `Page "${channelName}" already exists elsewhere in the space`,
+      existedElsewhere: true,
+      elsewherePageId: channelPage.pageId,
+      elsewherePageUrl: channelPage.pageUrl
+    };
   }
 
   const channelPageId = channelPage.pageId;
@@ -1192,6 +1343,8 @@ function handleRestart() {
   state.userMap = {};
   state.usersFilePath = '';
   state.confluenceSession = null;
+  state.lastImportResults = null;
+  state.lastSpaceKey = null;
   
   // Reset UI
   elements.folderPath.value = '';

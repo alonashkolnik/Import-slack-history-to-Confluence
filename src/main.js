@@ -101,26 +101,12 @@ ipcMain.handle('read-users-file', async (event, filePath) => {
   }
 });
 
-// Scan a channel folder for metadata only (no full message loading)
-// Returns { dateNames, messageCount }
+// Scan a channel folder for metadata only (no file reading, fast)
 function scanChannelFolder(folderPath) {
   const files = fs.readdirSync(folderPath)
     .filter(file => file.endsWith('.json') && /^\d{4}-\d{2}-\d{2}\.json$/.test(file))
     .sort();
-  
-  let messageCount = 0;
-  for (const file of files) {
-    try {
-      const content = fs.readFileSync(path.join(folderPath, file), 'utf-8');
-      const arr = JSON.parse(content);
-      if (Array.isArray(arr)) messageCount += arr.length;
-    } catch (e) { /* skip corrupt files */ }
-  }
-
-  return {
-    dateNames: files.map(file => file.replace('.json', '')),
-    messageCount
-  };
+  return files.map(file => file.replace('.json', '')); // date names only
 }
 
 // Read a single channel folder - loads all message data (used during import)
@@ -163,15 +149,14 @@ ipcMain.handle('read-slack-files', async (event, folderPath) => {
       
       for (const subfolder of subfolders) {
         const subfolderPath = path.join(folderPath, subfolder);
-        const scan = scanChannelFolder(subfolderPath);
+        const dateNames = scanChannelFolder(subfolderPath);
         
-        if (scan.dateNames.length > 0) {
+        if (dateNames.length > 0) {
           channels.push({
             channelName: subfolder,
             folderPath: subfolderPath,
-            fileCount: scan.dateNames.length,
-            messageCount: scan.messageCount,
-            dateNames: scan.dateNames
+            fileCount: dateNames.length,
+            dateNames: dateNames
           });
         }
       }
@@ -187,15 +172,14 @@ ipcMain.handle('read-slack-files', async (event, folderPath) => {
     }
     
     // Fallback: check for date JSON files directly (single channel mode)
-    const scan = scanChannelFolder(folderPath);
-    if (scan.dateNames.length > 0) {
+    const dateNames = scanChannelFolder(folderPath);
+    if (dateNames.length > 0) {
       return { 
         success: true, 
         mode: 'single', 
         folderPath: folderPath,
-        fileCount: scan.dateNames.length,
-        messageCount: scan.messageCount,
-        dateNames: scan.dateNames,
+        fileCount: dateNames.length,
+        dateNames: dateNames,
         folderName: path.basename(folderPath) 
       };
     }
