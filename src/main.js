@@ -101,11 +101,19 @@ ipcMain.handle('read-users-file', async (event, filePath) => {
   }
 });
 
-// Read a single channel folder (contains JSON files)
+// Scan a channel folder for metadata only (no message loading)
+function scanChannelFolder(folderPath) {
+  const files = fs.readdirSync(folderPath)
+    .filter(file => file.endsWith('.json') && /^\d{4}-\d{2}-\d{2}\.json$/.test(file))
+    .sort();
+  return files.map(file => file.replace('.json', '')); // Return date names only
+}
+
+// Read a single channel folder - loads all message data (used during import)
 function readChannelFolder(folderPath) {
   const files = fs.readdirSync(folderPath)
-    .filter(file => file.endsWith('.json'))
-    .sort(); // Sort chronologically by filename (YYYY-MM-DD.json format)
+    .filter(file => file.endsWith('.json') && /^\d{4}-\d{2}-\d{2}\.json$/.test(file))
+    .sort();
   
   const slackData = [];
   
@@ -113,8 +121,6 @@ function readChannelFolder(folderPath) {
     const filePath = path.join(folderPath, file);
     const content = fs.readFileSync(filePath, 'utf-8');
     const messages = JSON.parse(content);
-    
-    // Extract date from filename (e.g., "2024-01-15.json" -> "2024-01-15")
     const dateName = file.replace('.json', '');
     
     slackData.push({
@@ -127,39 +133,31 @@ function readChannelFolder(folderPath) {
   return slackData;
 }
 
-// Handle reading Slack export files from folder
+// Handle scanning Slack export folder - returns metadata only (fast)
 ipcMain.handle('read-slack-files', async (event, folderPath) => {
   try {
     const items = fs.readdirSync(folderPath);
     
-    // Check if folder contains JSON files (single channel) or subfolders (multiple channels)
-    const jsonFiles = items.filter(item => item.endsWith('.json'));
     const subfolders = items.filter(item => {
       const itemPath = path.join(folderPath, item);
       return fs.statSync(itemPath).isDirectory();
     });
     
-    // PRIORITY: Check for subfolders with JSON files first (multi-channel mode)
-    // This handles Slack exports that have both channel folders AND metadata JSON files
+    // PRIORITY: Check for subfolders with date JSON files first (multi-channel mode)
     if (subfolders.length > 0) {
       const channels = [];
       
       for (const subfolder of subfolders) {
         const subfolderPath = path.join(folderPath, subfolder);
-        const subItems = fs.readdirSync(subfolderPath);
-        const hasJsonFiles = subItems.some(item => item.endsWith('.json'));
+        const dateNames = scanChannelFolder(subfolderPath);
         
-        if (hasJsonFiles) {
-          const channelData = readChannelFolder(subfolderPath);
-          if (channelData.length > 0) {
-            channels.push({
-              channelName: subfolder,
-              folderPath: subfolderPath,
-              data: channelData,
-              fileCount: channelData.length,
-              messageCount: channelData.reduce((sum, day) => sum + day.messages.length, 0)
-            });
-          }
+        if (dateNames.length > 0) {
+          channels.push({
+            channelName: subfolder,
+            folderPath: subfolderPath,
+            fileCount: dateNames.length,
+            dateNames: dateNames
+          });
         }
       }
       
@@ -173,18 +171,30 @@ ipcMain.handle('read-slack-files', async (event, folderPath) => {
       }
     }
     
-    // Fallback: If no valid channel subfolders found, check for JSON files (single channel mode)
-    if (jsonFiles.length > 0) {
-      const slackData = readChannelFolder(folderPath);
+    // Fallback: check for date JSON files directly (single channel mode)
+    const dateNames = scanChannelFolder(folderPath);
+    if (dateNames.length > 0) {
       return { 
         success: true, 
         mode: 'single', 
-        data: slackData, 
+        folderPath: folderPath,
+        fileCount: dateNames.length,
+        dateNames: dateNames,
         folderName: path.basename(folderPath) 
       };
     }
     
-    return { success: false, error: 'No Slack export files found. Select a folder containing JSON files or channel subfolders.' };
+    return { success: false, error: 'No Slack export files found. Select a folder containing YYYY-MM-DD.json files or channel subfolders.' };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+// Lazy-load a single channel's full message data (called during import)
+ipcMain.handle('read-channel-data', async (event, folderPath) => {
+  try {
+    const slackData = readChannelFolder(folderPath);
+    return { success: true, data: slackData };
   } catch (error) {
     return { success: false, error: error.message };
   }

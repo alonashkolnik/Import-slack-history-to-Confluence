@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   selectUsersFile: () => ipcRenderer.invoke('select-users-file'),
   readUsersFile: (filePath) => ipcRenderer.invoke('read-users-file', filePath),
   readSlackFiles: (folderPath) => ipcRenderer.invoke('read-slack-files', folderPath),
+  readChannelData: (folderPath) => ipcRenderer.invoke('read-channel-data', folderPath),
   openConfluenceLogin: (url) => ipcRenderer.invoke('open-confluence-login', url),
   closeConfluenceWindow: () => ipcRenderer.invoke('close-confluence-window'),
   getConfluenceSession: (baseUrl) => ipcRenderer.invoke('get-confluence-session', baseUrl),

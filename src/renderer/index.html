@@ -49,9 +49,13 @@
         <strong>Users loaded:</strong> <span id="users-count"></span> users
       </div>
 
+      <div id="folder-loading" class="info-box hidden">
+        <span class="spinner"></span> Scanning folder, please wait...
+      </div>
+
       <div id="folder-info" class="info-box hidden">
         <strong>Folder:</strong> <span id="folder-name"></span><br>
-        <strong>Files found:</strong> <span id="file-count"></span> JSON files
+        <strong>Files found:</strong> <span id="file-count"></span>
       </div>
 
       <button id="btn-login" class="btn btn-primary" disabled>Login to Confluence</button>
@@ -100,6 +104,8 @@
         </div>
         <p id="progress-text">Preparing...</p>
       </div>
+
+      <div id="channel-progress-list" class="channel-list hidden"></div>
     </section>
 
     <!-- Step 4: Complete -->

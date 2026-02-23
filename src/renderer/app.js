@@ -6,8 +6,7 @@ const state = {
   usersFilePath: '',
   userMap: {},    // Map of user ID to user info
   mode: 'single', // 'single' or 'multi'
-  slackData: [],  // For single channel mode
-  channels: [],   // For multi-channel mode
+  channels: [],   // Metadata only: { channelName, folderPath, fileCount, dateNames }
   confluenceSession: null,
   baseUrl: '',
   spaceKey: '',
@@ -27,9 +26,11 @@ const elements = {
   btnImport: document.getElementById('btn-import'),
   btnRestart: document.getElementById('btn-restart'),
   btnDismissError: document.getElementById('btn-dismiss-error'),
+  folderLoading: document.getElementById('folder-loading'),
   folderInfo: document.getElementById('folder-info'),
   folderName: document.getElementById('folder-name'),
   fileCount: document.getElementById('file-count'),
+  channelProgressList: document.getElementById('channel-progress-list'),
   loginPending: document.getElementById('login-pending'),
   loginSuccess: document.getElementById('login-success'),
   importSummary: document.getElementById('import-summary'),
@@ -73,7 +74,7 @@ function validateConfig() {
   const parentPageUrl = elements.parentPageUrl.value.trim();
   const folderPath = elements.folderPath.value.trim();
 
-  const hasData = state.mode === 'single' ? state.slackData.length > 0 : state.channels.length > 0;
+  const hasData = state.channels.length > 0;
   const isValid = parentPageUrl && folderPath && hasData;
   elements.btnLogin.disabled = !isValid;
 }
@@ -87,9 +88,15 @@ async function handleSelectFolder() {
     elements.folderPath.value = folderPath;
     state.folderPath = folderPath;
 
-    // Read Slack files
+    // Show loading indicator
+    elements.folderInfo.classList.add('hidden');
+    elements.folderLoading.classList.remove('hidden');
+
+    // Scan folder (metadata only - fast)
     const result = await window.electronAPI.readSlackFiles(folderPath);
     
+    elements.folderLoading.classList.add('hidden');
+
     if (!result.success) {
       showError(result.error);
       return;
@@ -99,27 +106,30 @@ async function handleSelectFolder() {
     state.folderName = result.folderName;
 
     if (result.mode === 'single') {
-      // Single channel mode
-      state.slackData = result.data;
-      state.channels = [];
+      // Single channel: store as one-element channels array for uniform handling
+      state.channels = [{
+        channelName: result.folderName,
+        folderPath: result.folderPath,
+        fileCount: result.fileCount,
+        dateNames: result.dateNames
+      }];
       
       elements.folderName.textContent = result.folderName;
-      elements.fileCount.textContent = `${result.data.length} JSON files (single channel)`;
+      elements.fileCount.textContent = `${result.fileCount} daily files (single channel)`;
     } else {
-      // Multi-channel mode
-      state.slackData = [];
+      // Multi-channel: metadata only
       state.channels = result.channels;
       
-      const totalMessages = result.channels.reduce((sum, ch) => sum + ch.messageCount, 0);
       const totalFiles = result.channels.reduce((sum, ch) => sum + ch.fileCount, 0);
       
       elements.folderName.textContent = result.folderName;
-      elements.fileCount.textContent = `${result.channels.length} channels, ${totalFiles} files, ${totalMessages} messages`;
+      elements.fileCount.textContent = `${result.channels.length} channels, ${totalFiles} daily files`;
     }
     
     elements.folderInfo.classList.remove('hidden');
     validateConfig();
   } catch (error) {
+    elements.folderLoading.classList.add('hidden');
     showError('Failed to read folder: ' + error.message);
   }
 }
@@ -258,15 +268,13 @@ function handleLoginComplete(data) {
 
 // Prepare import summary
 function prepareImport() {
-  if (state.mode === 'single') {
-    const totalMessages = state.slackData.reduce((sum, day) => sum + day.messages.length, 0);
-    elements.summaryChannel.textContent = `Channel: ${state.folderName}`;
-    elements.summaryFiles.textContent = `${state.slackData.length} days, ${totalMessages} messages`;
+  const totalFiles = state.channels.reduce((sum, ch) => sum + ch.fileCount, 0);
+  if (state.channels.length === 1) {
+    elements.summaryChannel.textContent = `Channel: ${state.channels[0].channelName}`;
+    elements.summaryFiles.textContent = `${totalFiles} daily files`;
   } else {
-    const totalMessages = state.channels.reduce((sum, ch) => sum + ch.messageCount, 0);
-    const totalFiles = state.channels.reduce((sum, ch) => sum + ch.fileCount, 0);
     elements.summaryChannel.textContent = `Multi-channel import: ${state.channels.length} channels`;
-    elements.summaryFiles.textContent = `${totalFiles} days total, ${totalMessages} messages`;
+    elements.summaryFiles.textContent = `${totalFiles} daily files total`;
   }
   elements.summaryDestination.innerHTML = `Parent Page ID: <strong>${state.parentPageId}</strong><br>Base URL: ${state.baseUrl}`;
 }
@@ -276,18 +284,65 @@ async function handleImport() {
   elements.btnImport.disabled = true;
   elements.importProgress.classList.remove('hidden');
 
+  // Build channel progress list UI
+  buildChannelProgressList();
+
   try {
-    if (state.mode === 'single') {
-      // Single channel import
-      await importSingleChannel();
-    } else {
-      // Multi-channel import
-      await importMultipleChannels();
-    }
+    await importAllChannels();
   } catch (error) {
     showError('Import failed: ' + error.message);
     elements.btnImport.disabled = false;
     elements.importProgress.classList.add('hidden');
+  }
+}
+
+// Build the per-channel progress list in the UI
+function buildChannelProgressList() {
+  const list = elements.channelProgressList;
+  list.innerHTML = '';
+  list.classList.remove('hidden');
+
+  for (const channel of state.channels) {
+    const item = document.createElement('div');
+    item.className = 'channel-item pending';
+    item.id = `ch-progress-${channel.channelName}`;
+    item.innerHTML = `
+      <span class="channel-status-icon">⏳</span>
+      <span class="channel-name">${escapeHtml(channel.channelName)}</span>
+      <span class="channel-detail">${channel.fileCount} files</span>
+      <div class="channel-error-msg"></div>
+    `;
+    list.appendChild(item);
+  }
+}
+
+// Update a single channel's status in the progress list
+function updateChannelStatus(channelName, status, detail, errorMsg) {
+  const item = document.getElementById(`ch-progress-${channelName}`);
+  if (!item) return;
+
+  item.className = `channel-item ${status}`;
+  const icon = item.querySelector('.channel-status-icon');
+  const detailEl = item.querySelector('.channel-detail');
+  const errorEl = item.querySelector('.channel-error-msg');
+
+  switch (status) {
+    case 'in-progress':
+      icon.innerHTML = '<span class="spinner"></span>';
+      break;
+    case 'success':
+      icon.textContent = '\u2705';
+      break;
+    case 'error':
+      icon.textContent = '\u274C';
+      if (errorMsg && errorEl) {
+        errorEl.textContent = errorMsg;
+      }
+      break;
+  }
+
+  if (detail) {
+    detailEl.textContent = detail;
   }
 }
 
@@ -398,29 +453,44 @@ function buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey,
 
 // ==================== Import Logic ====================
 
-// Import a single channel (monthly pages)
-async function importSingleChannel() {
-  updateProgress(5, 'Grouping messages by month...');
-  await importChannelWithMonthlyPages(state.folderName, state.slackData, state.spaceKey, state.parentPageId, 5, 95);
-  showStep('complete');
-}
-
-// Import multiple channels (each with monthly pages)
-async function importMultipleChannels() {
+// Unified import: handles both single and multi-channel with lazy loading
+async function importAllChannels() {
   const totalChannels = state.channels.length;
   const results = [];
+
+  // Resolve space key once
+  const spaceKeyResolved = await resolveSpaceKey(state.spaceKey, state.parentPageId);
+  if (!spaceKeyResolved) {
+    throw new Error('Could not determine space key from parent page');
+  }
 
   for (let i = 0; i < totalChannels; i++) {
     const channel = state.channels[i];
     const progressStart = Math.round((i / totalChannels) * 90) + 5;
     const progressEnd = Math.round(((i + 1) / totalChannels) * 90) + 5;
 
-    updateProgress(progressStart, `Importing channel ${i + 1}/${totalChannels}: ${channel.channelName}...`);
+    updateChannelStatus(channel.channelName, 'in-progress', 'Loading data...');
+    updateProgress(progressStart, `Loading channel ${i + 1}/${totalChannels}: ${channel.channelName}...`);
 
     try {
-      await importChannelWithMonthlyPages(channel.channelName, channel.data, state.spaceKey, state.parentPageId, progressStart, progressEnd);
+      // Lazy-load channel data from disk
+      const dataResult = await window.electronAPI.readChannelData(channel.folderPath);
+      if (!dataResult.success) {
+        throw new Error(dataResult.error);
+      }
+
+      const slackData = dataResult.data;
+      updateChannelStatus(channel.channelName, 'in-progress', `${slackData.length} days loaded, importing...`);
+
+      // Import this channel with monthly pages
+      const importResult = await importChannelWithMonthlyPages(
+        channel.channelName, slackData, spaceKeyResolved, state.parentPageId, progressStart, progressEnd
+      );
+
+      updateChannelStatus(channel.channelName, 'success', importResult.summary);
       results.push({ channelName: channel.channelName, success: true });
     } catch (error) {
+      updateChannelStatus(channel.channelName, 'error', 'Failed', error.message);
       results.push({ channelName: channel.channelName, success: false, message: error.message });
     }
   }
@@ -430,7 +500,7 @@ async function importMultipleChannels() {
 
   updateProgress(100, `Complete! ${successes} channels imported, ${failures} failed`);
 
-  const parentPageUrl = `${state.baseUrl}/wiki/spaces/${state.spaceKey}/pages/${state.parentPageId}`;
+  const parentPageUrl = `${state.baseUrl}/wiki/spaces/${spaceKeyResolved}/pages/${state.parentPageId}`;
   elements.pageLink.href = parentPageUrl;
 
   const successMessage = document.querySelector('.success-box p');
@@ -446,18 +516,13 @@ async function importMultipleChannels() {
 }
 
 // Core: import a single channel as parent page + monthly child pages
-async function importChannelWithMonthlyPages(channelName, slackData, spaceKey, parentPageId, progressStart, progressEnd) {
+// Returns { summary } string for the channel progress UI
+async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyResolved, parentPageId, progressStart, progressEnd) {
   const monthsMap = groupByMonth(slackData);
   const monthKeys = Array.from(monthsMap.keys()); // sorted
   const totalMonths = monthKeys.length;
 
-  // Step 1: Resolve space key from parent page
-  const spaceKeyResolved = await resolveSpaceKey(spaceKey, parentPageId);
-  if (!spaceKeyResolved) {
-    throw new Error('Could not determine space key from parent page');
-  }
-
-  // Step 2: Create or find the channel parent page
+  // Create or find the channel parent page
   const channelParentContent = buildChannelParentContent(channelName);
   const channelPage = await findOrCreatePage(channelName, channelParentContent, spaceKeyResolved, parentPageId);
   if (!channelPage.success) {
@@ -465,12 +530,11 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKey, p
   }
 
   const channelPageId = channelPage.pageId;
-  const channelPageUrl = channelPage.pageUrl;
 
-  // Set link for single-channel mode
-  elements.pageLink.href = channelPageUrl;
+  // Set link (useful for single-channel mode)
+  elements.pageLink.href = channelPage.pageUrl;
 
-  // Step 3: Create monthly child pages
+  // Create monthly child pages
   let createdCount = 0;
   let skippedCount = 0;
 
@@ -480,7 +544,8 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKey, p
     const nextMonthKey = i < totalMonths - 1 ? monthKeys[i + 1] : null;
 
     const progress = progressStart + ((i / totalMonths) * (progressEnd - progressStart));
-    updateProgress(Math.round(progress), `Creating page for ${formatMonthLabel(monthKey)} (${i + 1}/${totalMonths})...`);
+    updateProgress(Math.round(progress), `${channelName}: ${formatMonthLabel(monthKey)} (${i + 1}/${totalMonths})`);
+    updateChannelStatus(channelName, 'in-progress', `${formatMonthLabel(monthKey)} (${i + 1}/${totalMonths})`);
 
     const monthTitle = buildMonthlyPageTitle(channelName, monthKey);
     const monthData = monthsMap.get(monthKey);
@@ -496,7 +561,6 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKey, p
 
       if (newDatesCount === 0) {
         skippedCount++;
-        console.log(`Month ${monthTitle} is up to date, skipping.`);
 
         // Still update nav links if neighbors changed
         const needsNavUpdate = checkNavLinksNeedUpdate(existingMonthPage.content, channelName, prevMonthKey, nextMonthKey);
@@ -507,7 +571,7 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKey, p
         continue;
       }
 
-      // Rebuild the full monthly page with all dates (simpler than appending)
+      // Rebuild the full monthly page with all dates
       const updatedFullContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
       const updateResult = await updatePageContent(existingMonthPage.id, monthTitle, updatedFullContent, existingMonthPage.version);
       if (updateResult.success) {
@@ -524,12 +588,8 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKey, p
     }
   }
 
-  updateProgress(progressEnd, `${channelName}: ${createdCount} month(s) created/updated, ${skippedCount} up to date`);
-
-  const successMessage = document.querySelector('.success-box p');
-  if (successMessage) {
-    successMessage.textContent = `Imported ${channelName}: ${createdCount} month page(s) created/updated, ${skippedCount} already up to date.`;
-  }
+  const summary = `${createdCount} month(s) created/updated, ${skippedCount} up to date`;
+  return { summary };
 }
 
 // Check if navigation links need updating (e.g., a new month was added)
@@ -1047,7 +1107,6 @@ function hideError() {
 // Restart the process
 function handleRestart() {
   // Reset state
-  state.slackData = [];
   state.channels = [];
   state.userMap = {};
   state.usersFilePath = '';
@@ -1056,11 +1115,14 @@ function handleRestart() {
   // Reset UI
   elements.folderPath.value = '';
   elements.usersFilePath.value = '';
+  elements.folderLoading.classList.add('hidden');
   elements.folderInfo.classList.add('hidden');
   elements.usersInfo.classList.add('hidden');
   elements.loginPending.classList.remove('hidden');
   elements.loginSuccess.classList.add('hidden');
   elements.importProgress.classList.add('hidden');
+  elements.channelProgressList.classList.add('hidden');
+  elements.channelProgressList.innerHTML = '';
   elements.btnLogin.disabled = true;
   elements.btnImport.disabled = false;
   elements.progressFill.style.width = '0%';
