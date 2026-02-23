@@ -31,6 +31,7 @@ const elements = {
   folderName: document.getElementById('folder-name'),
   fileCount: document.getElementById('file-count'),
   channelProgressList: document.getElementById('channel-progress-list'),
+  importResultsList: document.getElementById('import-results-list'),
   loginPending: document.getElementById('login-pending'),
   loginSuccess: document.getElementById('login-success'),
   importSummary: document.getElementById('import-summary'),
@@ -346,6 +347,30 @@ function updateChannelStatus(channelName, status, detail, errorMsg) {
   }
 }
 
+// Build the final results list shown on the completion screen
+function buildImportResultsList(results) {
+  const list = elements.importResultsList;
+  list.innerHTML = '';
+  list.classList.remove('hidden');
+
+  for (const r of results) {
+    const item = document.createElement('div');
+    const statusClass = r.success ? 'success' : 'error';
+    const icon = r.success ? '\u2705' : '\u274C';
+    const detail = r.success ? (r.summary || 'Done') : 'Failed';
+    const errorHtml = r.message ? `<div class="channel-error-msg">${escapeHtml(r.message)}</div>` : '';
+
+    item.className = `channel-item ${statusClass}`;
+    item.innerHTML = `
+      <span class="channel-status-icon">${icon}</span>
+      <span class="channel-name">${escapeHtml(r.channelName)}</span>
+      <span class="channel-detail">${escapeHtml(detail)}</span>
+      ${errorHtml}
+    `;
+    list.appendChild(item);
+  }
+}
+
 // ==================== Monthly Page Utilities ====================
 
 // Group slackData (array of { dateName, messages }) by month key "YYYY-MM"
@@ -488,7 +513,7 @@ async function importAllChannels() {
       );
 
       updateChannelStatus(channel.channelName, 'success', importResult.summary);
-      results.push({ channelName: channel.channelName, success: true });
+      results.push({ channelName: channel.channelName, success: true, summary: importResult.summary });
     } catch (error) {
       updateChannelStatus(channel.channelName, 'error', 'Failed', error.message);
       results.push({ channelName: channel.channelName, success: false, message: error.message });
@@ -511,6 +536,9 @@ async function importAllChannels() {
       successMessage.textContent = `Successfully imported all ${successes} channels!`;
     }
   }
+
+  // Build results list on completion screen
+  buildImportResultsList(results);
 
   showStep('complete');
 }
@@ -647,12 +675,44 @@ async function createNewPage(title, content, spaceKey, parentPageId) {
   });
 
   if (!response.ok) {
+    // Handle "page already exists" — find it anywhere in the space and reuse it
+    const errMsg = JSON.stringify(response.data).toLowerCase();
+    if (errMsg.includes('already exists') || errMsg.includes('duplicate') || response.status === 409) {
+      console.log(`Page "${title}" already exists in space, searching for it...`);
+      const existing = await findPageByTitleInSpace(title, spaceKey);
+      if (existing) {
+        const pageUrl = `${state.baseUrl}/wiki/spaces/${spaceKey}/pages/${existing.id}`;
+        return { success: true, pageId: existing.id, pageUrl, alreadyExisted: true };
+      }
+    }
     return { success: false, error: `Failed to create page "${title}": ${response.status} - ${JSON.stringify(response.data)}` };
   }
 
   const page = response.data;
   const pageUrl = `${state.baseUrl}/wiki${page._links?.webui || `/spaces/${spaceKey}/pages/${page.id}`}`;
   return { success: true, pageId: page.id, pageUrl };
+}
+
+// Find a page by title anywhere in the space (no parent filter)
+async function findPageByTitleInSpace(title, spaceKey) {
+  try {
+    const searchUrl = `${state.baseUrl}/wiki/rest/api/content?title=${encodeURIComponent(title)}&spaceKey=${spaceKey}&expand=body.storage,version`;
+    const response = await window.electronAPI.confluenceApiRequest({ method: 'GET', url: searchUrl });
+    if (!response.ok) return null;
+    const results = response.data.results || [];
+    if (results.length > 0) {
+      const page = results[0];
+      return {
+        id: page.id,
+        version: page.version?.number || 1,
+        content: page.body?.storage?.value || ''
+      };
+    }
+    return null;
+  } catch (error) {
+    console.error('findPageByTitleInSpace error:', error);
+    return null;
+  }
 }
 
 // Update an existing Confluence page
@@ -1123,6 +1183,8 @@ function handleRestart() {
   elements.importProgress.classList.add('hidden');
   elements.channelProgressList.classList.add('hidden');
   elements.channelProgressList.innerHTML = '';
+  elements.importResultsList.classList.add('hidden');
+  elements.importResultsList.innerHTML = '';
   elements.btnLogin.disabled = true;
   elements.btnImport.disabled = false;
   elements.progressFill.style.width = '0%';
