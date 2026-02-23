@@ -112,19 +112,21 @@ async function handleSelectFolder() {
         channelName: result.folderName,
         folderPath: result.folderPath,
         fileCount: result.fileCount,
+        messageCount: result.messageCount || 0,
         dateNames: result.dateNames
       }];
       
       elements.folderName.textContent = result.folderName;
-      elements.fileCount.textContent = `${result.fileCount} daily files (single channel)`;
+      elements.fileCount.textContent = `${result.fileCount} daily files, ${(result.messageCount || 0).toLocaleString()} messages (single channel)`;
     } else {
       // Multi-channel: metadata only
       state.channels = result.channels;
       
       const totalFiles = result.channels.reduce((sum, ch) => sum + ch.fileCount, 0);
+      const totalMessages = result.channels.reduce((sum, ch) => sum + (ch.messageCount || 0), 0);
       
       elements.folderName.textContent = result.folderName;
-      elements.fileCount.textContent = `${result.channels.length} channels, ${totalFiles} daily files`;
+      elements.fileCount.textContent = `${result.channels.length} channels, ${totalFiles} daily files, ${totalMessages.toLocaleString()} messages`;
     }
     
     elements.folderInfo.classList.remove('hidden');
@@ -270,12 +272,13 @@ function handleLoginComplete(data) {
 // Prepare import summary
 function prepareImport() {
   const totalFiles = state.channels.reduce((sum, ch) => sum + ch.fileCount, 0);
+  const totalMessages = state.channels.reduce((sum, ch) => sum + (ch.messageCount || 0), 0);
   if (state.channels.length === 1) {
     elements.summaryChannel.textContent = `Channel: ${state.channels[0].channelName}`;
-    elements.summaryFiles.textContent = `${totalFiles} daily files`;
+    elements.summaryFiles.textContent = `${totalFiles} daily files, ${totalMessages.toLocaleString()} messages`;
   } else {
     elements.summaryChannel.textContent = `Multi-channel import: ${state.channels.length} channels`;
-    elements.summaryFiles.textContent = `${totalFiles} daily files total`;
+    elements.summaryFiles.textContent = `${totalFiles} daily files, ${totalMessages.toLocaleString()} messages total`;
   }
   elements.summaryDestination.innerHTML = `Parent Page ID: <strong>${state.parentPageId}</strong><br>Base URL: ${state.baseUrl}`;
 }
@@ -557,6 +560,11 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
     throw new Error(channelPage.error);
   }
 
+  // If channel parent page exists elsewhere (not under our parent), skip the whole channel
+  if (channelPage.existedElsewhere) {
+    return { summary: `Skipped \u2014 page "${channelName}" already exists elsewhere in the space` };
+  }
+
   const channelPageId = channelPage.pageId;
 
   // Set link (useful for single-channel mode)
@@ -565,6 +573,7 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
   // Create monthly child pages
   let createdCount = 0;
   let skippedCount = 0;
+  let elsewhereCount = 0;
 
   for (let i = 0; i < totalMonths; i++) {
     const monthKey = monthKeys[i];
@@ -579,11 +588,11 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
     const monthData = monthsMap.get(monthKey);
     const monthContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
 
-    // Check if monthly page already exists
+    // Check if monthly page already exists under channel parent
     const existingMonthPage = await findExistingPage(monthTitle, spaceKeyResolved, channelPageId);
 
     if (existingMonthPage) {
-      // Incremental: check for new dates in this month
+      // Page is a subpage — safe to update
       const existingDates = extractExistingDates(existingMonthPage.content);
       const { html: newContent, newDatesCount } = buildIncrementalContent(monthData, existingDates);
 
@@ -606,17 +615,24 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
         createdCount++;
       }
     } else {
-      // Create new monthly page
+      // Try to create new monthly page
       const createResult = await createNewPage(monthTitle, monthContent, spaceKeyResolved, channelPageId);
       if (createResult.success) {
         createdCount++;
+      } else if (createResult.existsElsewhere) {
+        // Page exists elsewhere in space — skip it, don't update without permission
+        elsewhereCount++;
+        console.log(`Skipping "${monthTitle}" — exists elsewhere in space`);
       } else {
         console.error(`Failed to create page ${monthTitle}:`, createResult.error);
       }
     }
   }
 
-  const summary = `${createdCount} month(s) created/updated, ${skippedCount} up to date`;
+  let summary = `${createdCount} month(s) created/updated, ${skippedCount} up to date`;
+  if (elsewhereCount > 0) {
+    summary += `, ${elsewhereCount} skipped (exist elsewhere in space)`;
+  }
   return { summary };
 }
 
@@ -643,14 +659,23 @@ async function resolveSpaceKey(spaceKey, parentPageId) {
   return response.data.space?.key || spaceKey;
 }
 
-// Find or create a page (returns { success, pageId, pageUrl, error })
+// Find or create a page (returns { success, pageId, pageUrl, error, skippedElsewhere })
 async function findOrCreatePage(title, content, spaceKey, parentPageId) {
   const existing = await findExistingPage(title, spaceKey, parentPageId);
   if (existing) {
     const pageUrl = `${state.baseUrl}/wiki/spaces/${spaceKey}/pages/${existing.id}`;
     return { success: true, pageId: existing.id, pageUrl };
   }
-  return await createNewPage(title, content, spaceKey, parentPageId);
+  const result = await createNewPage(title, content, spaceKey, parentPageId);
+  // If page exists elsewhere in space, find it and return with a flag
+  if (result.existsElsewhere) {
+    const elsewhere = await findPageByTitleInSpace(title, spaceKey);
+    if (elsewhere) {
+      const pageUrl = `${state.baseUrl}/wiki/spaces/${spaceKey}/pages/${elsewhere.id}`;
+      return { success: true, pageId: elsewhere.id, pageUrl, existedElsewhere: true };
+    }
+  }
+  return result;
 }
 
 // Create a new Confluence page
@@ -675,15 +700,11 @@ async function createNewPage(title, content, spaceKey, parentPageId) {
   });
 
   if (!response.ok) {
-    // Handle "page already exists" — find it anywhere in the space and reuse it
+    // Detect "page already exists" error
     const errMsg = JSON.stringify(response.data).toLowerCase();
     if (errMsg.includes('already exists') || errMsg.includes('duplicate') || response.status === 409) {
-      console.log(`Page "${title}" already exists in space, searching for it...`);
-      const existing = await findPageByTitleInSpace(title, spaceKey);
-      if (existing) {
-        const pageUrl = `${state.baseUrl}/wiki/spaces/${spaceKey}/pages/${existing.id}`;
-        return { success: true, pageId: existing.id, pageUrl, alreadyExisted: true };
-      }
+      console.log(`Page "${title}" already exists elsewhere in space.`);
+      return { success: false, existsElsewhere: true, error: `Page "${title}" already exists elsewhere in the space` };
     }
     return { success: false, error: `Failed to create page "${title}": ${response.status} - ${JSON.stringify(response.data)}` };
   }
