@@ -332,20 +332,20 @@ function buildChannelParentContent(channelName) {
 
 // Build navigation links for a monthly page
 function buildNavLinks(channelName, prevMonthKey, nextMonthKey) {
-  let html = '<div style="display: flex; justify-content: space-between; padding: 8px 0; border-top: 1px solid #dfe1e6; border-bottom: 1px solid #dfe1e6; margin: 12px 0;">';
+  let html = '<table style="width: 100%; border-top: 2px solid #dfe1e6; border-bottom: 2px solid #dfe1e6; margin: 16px 0; padding: 0;"><tbody><tr>';
+  html += '<td style="text-align: left; padding: 12px 8px; font-size: 16px; font-weight: bold;">';
   if (prevMonthKey) {
     const prevTitle = buildMonthlyPageTitle(channelName, prevMonthKey);
-    html += `<ac:link><ri:page ri:content-title="${escapeHtml(prevTitle)}" /><ac:plain-text-link-body><![CDATA[⬅ ${formatMonthLabel(prevMonthKey)}]]></ac:plain-text-link-body></ac:link>`;
-  } else {
-    html += '<span></span>';
+    html += `<ac:link><ri:page ri:content-title="${escapeHtml(prevTitle)}" /><ac:plain-text-link-body><![CDATA[\u2b05 ${formatMonthLabel(prevMonthKey)}]]></ac:plain-text-link-body></ac:link>`;
   }
+  html += '</td>';
+  html += '<td style="text-align: right; padding: 12px 8px; font-size: 16px; font-weight: bold;">';
   if (nextMonthKey) {
     const nextTitle = buildMonthlyPageTitle(channelName, nextMonthKey);
-    html += `<ac:link><ri:page ri:content-title="${escapeHtml(nextTitle)}" /><ac:plain-text-link-body><![CDATA[${formatMonthLabel(nextMonthKey)} ➡]]></ac:plain-text-link-body></ac:link>`;
-  } else {
-    html += '<span></span>';
+    html += `<ac:link><ri:page ri:content-title="${escapeHtml(nextTitle)}" /><ac:plain-text-link-body><![CDATA[${formatMonthLabel(nextMonthKey)} \u27a1]]></ac:plain-text-link-body></ac:link>`;
   }
-  html += '</div>\n';
+  html += '</td>';
+  html += '</tr></tbody></table>\n';
   return html;
 }
 
@@ -774,7 +774,10 @@ function renderRichTextElements(elements) {
         break;
         
       case 'user':
-        html += `<strong>@user</strong>`;
+        const mentionUserId = el.user_id || '';
+        const mentionUser = state.userMap[mentionUserId];
+        const mentionName = mentionUser ? (mentionUser.displayName || mentionUser.realName || mentionUser.name || mentionUserId) : mentionUserId || 'user';
+        html += `<strong>@${escapeHtml(mentionName)}</strong>`;
         break;
         
       case 'usergroup':
@@ -816,6 +819,16 @@ function formatSlackText(text) {
   // Links: <url|text> or <url>
   formatted = formatted.replace(/<(https?:\/\/[^|>]+)\|([^>]+)>/g, '<a href="$1">$2</a>');
   formatted = formatted.replace(/<(https?:\/\/[^>]+)>/g, '<a href="$1">$1</a>');
+  
+  // User mentions: <@U12345> or &lt;@U12345&gt; (after escapeHtml)
+  formatted = formatted.replace(/&lt;@(U[A-Z0-9]+)&gt;/g, (match, userId) => {
+    const user = state.userMap[userId];
+    if (user) {
+      const name = user.displayName || user.realName || user.name || userId;
+      return `<strong>@${escapeHtml(name)}</strong>`;
+    }
+    return `<strong>@${userId}</strong>`;
+  });
   
   // Newlines
   formatted = formatted.replace(/\n/g, '<br/>');
