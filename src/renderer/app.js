@@ -10,7 +10,8 @@ const state = {
   confluenceSession: null,
   baseUrl: '',
   spaceKey: '',
-  parentPageId: ''
+  parentPageId: '',
+  importErrorLog: [] // { timestamp, channelName, pageTitle, operation, error }
 };
 
 // DOM Elements
@@ -129,6 +130,18 @@ async function handleSelectFolder() {
     
     elements.folderInfo.classList.remove('hidden');
     validateConfig();
+
+    // Auto-detect users.json if not already loaded by the user
+    if (result.usersFilePath && !state.usersFilePath) {
+      const usersResult = await window.electronAPI.readUsersFile(result.usersFilePath);
+      if (usersResult.success) {
+        state.usersFilePath = result.usersFilePath;
+        state.userMap = usersResult.userMap;
+        elements.usersFilePath.value = result.usersFilePath + '  (auto-detected)';
+        elements.usersCount.textContent = usersResult.count;
+        elements.usersInfo.classList.remove('hidden');
+      }
+    }
   } catch (error) {
     elements.folderLoading.classList.add('hidden');
     showError('Failed to read folder: ' + error.message);
@@ -353,6 +366,10 @@ function buildImportResultsList(results) {
   list.innerHTML = '';
   list.classList.remove('hidden');
 
+  // Remove any existing error log download link
+  const existingLog = document.getElementById('import-error-log-section');
+  if (existingLog) existingLog.remove();
+
   for (const r of results) {
     const item = document.createElement('div');
 
@@ -453,6 +470,13 @@ async function importChannelMonthlyPagesInto(channelName, slackData, spaceKey, c
   let skippedCount = 0;
   let elsewhereCount = 0;
 
+  // Pre-fetch existing children page IDs for correct nav link URLs
+  const existingChildren = await getPageChildren(channelPageId);
+  const monthPageIds = new Map(existingChildren.map(c => [c.title, c.id]));
+  const pageVersions = new Map();
+  const newlyCreatedTitles = new Set();
+  const baseUrl = state.baseUrl || '';
+
   for (let i = 0; i < totalMonths; i++) {
     const monthKey = monthKeys[i];
     const prevMonthKey = i > 0 ? monthKeys[i - 1] : null;
@@ -460,34 +484,84 @@ async function importChannelMonthlyPagesInto(channelName, slackData, spaceKey, c
 
     const monthTitle = buildMonthlyPageTitle(channelName, monthKey);
     const monthData = monthsMap.get(monthKey);
-    const monthContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
+
+    const prevLabel = prevMonthKey ? formatMonthLabel(prevMonthKey) : null;
+    const nextLabel = nextMonthKey ? formatMonthLabel(nextMonthKey) : null;
+    const prevId = prevMonthKey ? monthPageIds.get(buildMonthlyPageTitle(channelName, prevMonthKey)) : null;
+    const nextId = nextMonthKey ? monthPageIds.get(buildMonthlyPageTitle(channelName, nextMonthKey)) : null;
+    const prevUrl = prevId ? `${baseUrl}/wiki/spaces/${spaceKey}/pages/${prevId}` : null;
+    const nextUrl = nextId ? `${baseUrl}/wiki/spaces/${spaceKey}/pages/${nextId}` : null;
+
+    const monthContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
 
     const existingMonthPage = await findExistingPage(monthTitle, spaceKey, channelPageId);
 
     if (existingMonthPage) {
+      monthPageIds.set(monthTitle, existingMonthPage.id);
       const existingDates = extractExistingDates(existingMonthPage.content);
       const { newDatesCount } = buildIncrementalContent(monthData, existingDates);
 
       if (newDatesCount === 0) {
         skippedCount++;
+        pageVersions.set(monthTitle, existingMonthPage.version);
         const needsNavUpdate = checkNavLinksNeedUpdate(existingMonthPage.content, channelName, prevMonthKey, nextMonthKey);
         if (needsNavUpdate) {
-          const updatedFullContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
-          await updatePageContent(existingMonthPage.id, monthTitle, updatedFullContent, existingMonthPage.version);
+          const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+          await updatePageContent(existingMonthPage.id, monthTitle, updatedContent, existingMonthPage.version);
+          pageVersions.set(monthTitle, existingMonthPage.version + 1);
         }
         continue;
       }
 
-      const updatedFullContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
-      const updateResult = await updatePageContent(existingMonthPage.id, monthTitle, updatedFullContent, existingMonthPage.version);
-      if (updateResult.success) createdCount++;
+      const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+      const updateResult = await updatePageContent(existingMonthPage.id, monthTitle, updatedContent, existingMonthPage.version);
+      if (updateResult.success) {
+        createdCount++;
+        pageVersions.set(monthTitle, existingMonthPage.version + 1);
+      } else {
+        pageVersions.set(monthTitle, existingMonthPage.version);
+        logImportError(channelName, monthTitle, 'update page', updateResult.error);
+      }
     } else {
       const createResult = await createNewPage(monthTitle, monthContent, spaceKey, channelPageId);
       if (createResult.success) {
         createdCount++;
+        monthPageIds.set(monthTitle, createResult.pageId);
+        pageVersions.set(monthTitle, 1);
+        newlyCreatedTitles.add(monthTitle);
       } else if (createResult.existsElsewhere) {
         elsewhereCount++;
+      } else {
+        logImportError(channelName, monthTitle, 'create page', createResult.error);
       }
+    }
+  }
+
+  // Second pass: back-fill "next" links for pages whose next-month was just created in this run
+  for (let i = 0; i < totalMonths - 1; i++) {
+    const nextMonthKey = monthKeys[i + 1];
+    const nextTitle = buildMonthlyPageTitle(channelName, nextMonthKey);
+    if (!newlyCreatedTitles.has(nextTitle)) continue;
+
+    const monthKey = monthKeys[i];
+    const prevMonthKey = i > 0 ? monthKeys[i - 1] : null;
+    const currentTitle = buildMonthlyPageTitle(channelName, monthKey);
+    const currentPageId = monthPageIds.get(currentTitle);
+    const currentVersion = pageVersions.get(currentTitle);
+    if (!currentPageId || currentVersion === undefined) continue;
+
+    const prevLabel = prevMonthKey ? formatMonthLabel(prevMonthKey) : null;
+    const prevId = prevMonthKey ? monthPageIds.get(buildMonthlyPageTitle(channelName, prevMonthKey)) : null;
+    const prevUrl = prevId ? `${baseUrl}/wiki/spaces/${spaceKey}/pages/${prevId}` : null;
+    const nextLabel = formatMonthLabel(nextMonthKey);
+    const nextId = monthPageIds.get(nextTitle);
+    const nextUrl = nextId ? `${baseUrl}/wiki/spaces/${spaceKey}/pages/${nextId}` : null;
+
+    const monthData = monthsMap.get(monthKey);
+    const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+    const navUpdateResult = await updatePageContent(currentPageId, currentTitle, updatedContent, currentVersion);
+    if (!navUpdateResult.success) {
+      logImportError(channelName, currentTitle, 'update next-link', navUpdateResult.error);
     }
   }
 
@@ -526,28 +600,33 @@ function buildMonthlyPageTitle(channelName, monthKey) {
   return `${channelName} - ${formatMonthLabel(monthKey)}`;
 }
 
-// Build channel parent page content with children macro
+// Build channel parent page content
 function buildChannelParentContent(channelName) {
   let html = `<h1>Slack Channel: ${escapeHtml(channelName)}</h1>\n`;
   html += `<p><em>Imported on ${new Date().toLocaleString()}</em></p>\n`;
-  html += '<p>Monthly history pages are listed below:</p>\n';
-  html += '<ac:structured-macro ac:name="children"><ac:parameter ac:name="sort">title</ac:parameter><ac:parameter ac:name="all">true</ac:parameter></ac:structured-macro>\n';
+  html += '<ac:structured-macro ac:name="children"><ac:parameter ac:name="sort">title</ac:parameter></ac:structured-macro>\n';
   return html;
 }
 
-// Build navigation links for a monthly page
-function buildNavLinks(channelName, prevMonthKey, nextMonthKey) {
+// Build navigation links for a monthly page (prevUrl/nextUrl are full Confluence page URLs or null)
+function buildNavLinks(prevUrl, prevLabel, nextUrl, nextLabel) {
   let html = '<table style="width: 100%; border-top: 2px solid #dfe1e6; border-bottom: 2px solid #dfe1e6; margin: 16px 0; padding: 0;"><tbody><tr>';
   html += '<td style="text-align: left; padding: 12px 8px; font-size: 16px; font-weight: bold;">';
-  if (prevMonthKey) {
-    const prevTitle = buildMonthlyPageTitle(channelName, prevMonthKey);
-    html += `<ac:link><ri:page ri:content-title="${escapeHtml(prevTitle)}" /><ac:plain-text-link-body><![CDATA[\u2b05 ${formatMonthLabel(prevMonthKey)}]]></ac:plain-text-link-body></ac:link>`;
+  if (prevLabel) {
+    if (prevUrl) {
+      html += `<a href="${escapeHtml(prevUrl)}">&larr; ${escapeHtml(prevLabel)}</a>`;
+    } else {
+      html += `&larr; ${escapeHtml(prevLabel)}`;
+    }
   }
   html += '</td>';
   html += '<td style="text-align: right; padding: 12px 8px; font-size: 16px; font-weight: bold;">';
-  if (nextMonthKey) {
-    const nextTitle = buildMonthlyPageTitle(channelName, nextMonthKey);
-    html += `<ac:link><ri:page ri:content-title="${escapeHtml(nextTitle)}" /><ac:plain-text-link-body><![CDATA[${formatMonthLabel(nextMonthKey)} \u27a1]]></ac:plain-text-link-body></ac:link>`;
+  if (nextLabel) {
+    if (nextUrl) {
+      html += `<a href="${escapeHtml(nextUrl)}">${escapeHtml(nextLabel)} &rarr;</a>`;
+    } else {
+      html += `${escapeHtml(nextLabel)} &rarr;`;
+    }
   }
   html += '</td>';
   html += '</tr></tbody></table>\n';
@@ -555,12 +634,14 @@ function buildNavLinks(channelName, prevMonthKey, nextMonthKey) {
 }
 
 // Build content for a single monthly page
-function buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey) {
+// prevUrl/nextUrl: full Confluence page URLs (or null if page doesn't exist yet)
+// prevLabel/nextLabel: human-readable month labels (or null)
+function buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel) {
   let html = `<h1>${escapeHtml(channelName)} - ${escapeHtml(formatMonthLabel(monthKey))}</h1>\n`;
   html += `<p><em>Imported on ${new Date().toLocaleString()}</em></p>\n`;
 
   // Navigation at top
-  html += buildNavLinks(channelName, prevMonthKey, nextMonthKey);
+  html += buildNavLinks(prevUrl, prevLabel, nextUrl, nextLabel);
 
   for (const dayData of monthData) {
     html += `<h2>📅 ${escapeHtml(dayData.dateName)}</h2>\n`;
@@ -596,7 +677,7 @@ function buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey,
   }
 
   // Navigation at bottom
-  html += buildNavLinks(channelName, prevMonthKey, nextMonthKey);
+  html += buildNavLinks(prevUrl, prevLabel, nextUrl, nextLabel);
 
   return html;
 }
@@ -607,6 +688,9 @@ function buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey,
 async function importAllChannels() {
   const totalChannels = state.channels.length;
   const results = [];
+
+  // Reset error log for this run
+  state.importErrorLog = [];
 
   // Resolve space key once
   const spaceKeyResolved = await resolveSpaceKey(state.spaceKey, state.parentPageId);
@@ -686,8 +770,27 @@ async function importAllChannels() {
     successMessage.innerHTML = msg;
   }
 
+  // Reset error log before building list (accumulated during this run)
   // Build results list on completion screen
   buildImportResultsList(results);
+
+  // Append error log download link if any errors occurred
+  if (state.importErrorLog.length > 0) {
+    const logLines = state.importErrorLog.map(e =>
+      `[${e.timestamp}] ${e.operation.toUpperCase()} "${e.pageTitle}" (channel: ${e.channelName})\nError: ${e.error}\n`
+    ).join('\n');
+    const blob = new Blob([logLines], { type: 'text/plain' });
+    const blobUrl = URL.createObjectURL(blob);
+    const fileName = `import-errors-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+    const section = document.createElement('div');
+    section.id = 'import-error-log-section';
+    section.style.cssText = 'margin-top: 16px; padding: 12px; background: #fff3f3; border: 1px solid #f5a0a0; border-radius: 6px;';
+    section.innerHTML = `
+      <p style="margin: 0 0 8px 0; color: #c0392b; font-weight: bold;">⚠️ ${state.importErrorLog.length} error(s) occurred during import</p>
+      <a href="${blobUrl}" download="${fileName}" class="btn btn-secondary" style="font-size: 13px;">📄 Download Error Log</a>
+    `;
+    elements.importResultsList.parentElement.insertBefore(section, elements.importResultsList.nextSibling);
+  }
 
   showStep('complete');
 }
@@ -726,6 +829,13 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
   let skippedCount = 0;
   let elsewhereCount = 0;
 
+  // Pre-fetch existing children page IDs for correct nav link URLs
+  const existingChildren = await getPageChildren(channelPageId);
+  const monthPageIds = new Map(existingChildren.map(c => [c.title, c.id]));
+  const pageVersions = new Map(); // title → last known version after first pass
+  const newlyCreatedTitles = new Set();
+  const baseUrl = state.baseUrl || '';
+
   for (let i = 0; i < totalMonths; i++) {
     const monthKey = monthKeys[i];
     const prevMonthKey = i > 0 ? monthKeys[i - 1] : null;
@@ -737,46 +847,93 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
 
     const monthTitle = buildMonthlyPageTitle(channelName, monthKey);
     const monthData = monthsMap.get(monthKey);
-    const monthContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
+
+    const prevLabel = prevMonthKey ? formatMonthLabel(prevMonthKey) : null;
+    const nextLabel = nextMonthKey ? formatMonthLabel(nextMonthKey) : null;
+    const prevId = prevMonthKey ? monthPageIds.get(buildMonthlyPageTitle(channelName, prevMonthKey)) : null;
+    const nextId = nextMonthKey ? monthPageIds.get(buildMonthlyPageTitle(channelName, nextMonthKey)) : null;
+    const prevUrl = prevId ? `${baseUrl}/wiki/spaces/${spaceKeyResolved}/pages/${prevId}` : null;
+    const nextUrl = nextId ? `${baseUrl}/wiki/spaces/${spaceKeyResolved}/pages/${nextId}` : null;
+
+    const monthContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
 
     // Check if monthly page already exists under channel parent
     const existingMonthPage = await findExistingPage(monthTitle, spaceKeyResolved, channelPageId);
 
     if (existingMonthPage) {
+      monthPageIds.set(monthTitle, existingMonthPage.id);
       // Page is a subpage — safe to update
       const existingDates = extractExistingDates(existingMonthPage.content);
       const { html: newContent, newDatesCount } = buildIncrementalContent(monthData, existingDates);
 
       if (newDatesCount === 0) {
         skippedCount++;
+        pageVersions.set(monthTitle, existingMonthPage.version);
 
         // Still update nav links if neighbors changed
         const needsNavUpdate = checkNavLinksNeedUpdate(existingMonthPage.content, channelName, prevMonthKey, nextMonthKey);
         if (needsNavUpdate) {
-          const updatedFullContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
-          await updatePageContent(existingMonthPage.id, monthTitle, updatedFullContent, existingMonthPage.version);
+          const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+          await updatePageContent(existingMonthPage.id, monthTitle, updatedContent, existingMonthPage.version);
+          pageVersions.set(monthTitle, existingMonthPage.version + 1);
         }
         continue;
       }
 
       // Rebuild the full monthly page with all dates
-      const updatedFullContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevMonthKey, nextMonthKey);
-      const updateResult = await updatePageContent(existingMonthPage.id, monthTitle, updatedFullContent, existingMonthPage.version);
+      const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+      const updateResult = await updatePageContent(existingMonthPage.id, monthTitle, updatedContent, existingMonthPage.version);
       if (updateResult.success) {
         createdCount++;
+        pageVersions.set(monthTitle, existingMonthPage.version + 1);
+      } else {
+        pageVersions.set(monthTitle, existingMonthPage.version);
+        logImportError(channelName, monthTitle, 'update page', updateResult.error);
       }
     } else {
       // Try to create new monthly page
       const createResult = await createNewPage(monthTitle, monthContent, spaceKeyResolved, channelPageId);
       if (createResult.success) {
         createdCount++;
+        monthPageIds.set(monthTitle, createResult.pageId);
+        pageVersions.set(monthTitle, 1);
+        newlyCreatedTitles.add(monthTitle);
       } else if (createResult.existsElsewhere) {
         // Page exists elsewhere in space — skip it, don't update without permission
         elsewhereCount++;
         console.log(`Skipping "${monthTitle}" — exists elsewhere in space`);
       } else {
         console.error(`Failed to create page ${monthTitle}:`, createResult.error);
+        logImportError(channelName, monthTitle, 'create page', createResult.error);
       }
+    }
+  }
+
+  // Second pass: back-fill "next" links for pages whose next-month was just created in this run
+  for (let i = 0; i < totalMonths - 1; i++) {
+    const nextMonthKey = monthKeys[i + 1];
+    const nextTitle = buildMonthlyPageTitle(channelName, nextMonthKey);
+    if (!newlyCreatedTitles.has(nextTitle)) continue;
+
+    const monthKey = monthKeys[i];
+    const prevMonthKey = i > 0 ? monthKeys[i - 1] : null;
+    const currentTitle = buildMonthlyPageTitle(channelName, monthKey);
+    const currentPageId = monthPageIds.get(currentTitle);
+    const currentVersion = pageVersions.get(currentTitle);
+    if (!currentPageId || currentVersion === undefined) continue;
+
+    const prevLabel = prevMonthKey ? formatMonthLabel(prevMonthKey) : null;
+    const prevId = prevMonthKey ? monthPageIds.get(buildMonthlyPageTitle(channelName, prevMonthKey)) : null;
+    const prevUrl = prevId ? `${baseUrl}/wiki/spaces/${spaceKeyResolved}/pages/${prevId}` : null;
+    const nextLabel = formatMonthLabel(nextMonthKey);
+    const nextId = monthPageIds.get(nextTitle);
+    const nextUrl = nextId ? `${baseUrl}/wiki/spaces/${spaceKeyResolved}/pages/${nextId}` : null;
+
+    const monthData = monthsMap.get(monthKey);
+    const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+    const navUpdateResult = await updatePageContent(currentPageId, currentTitle, updatedContent, currentVersion);
+    if (!navUpdateResult.success) {
+      logImportError(channelName, currentTitle, 'update next-link', navUpdateResult.error);
     }
   }
 
@@ -790,17 +947,27 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
 // Check if navigation links need updating (e.g., a new month was added)
 function checkNavLinksNeedUpdate(existingContent, channelName, prevMonthKey, nextMonthKey) {
   if (prevMonthKey) {
-    const prevTitle = buildMonthlyPageTitle(channelName, prevMonthKey);
-    if (!existingContent.includes(prevTitle)) return true;
+    const prevLabel = formatMonthLabel(prevMonthKey);
+    if (!existingContent.includes(prevLabel)) return true;
   }
   if (nextMonthKey) {
-    const nextTitle = buildMonthlyPageTitle(channelName, nextMonthKey);
-    if (!existingContent.includes(nextTitle)) return true;
+    const nextLabel = formatMonthLabel(nextMonthKey);
+    if (!existingContent.includes(nextLabel)) return true;
   }
   return false;
 }
 
 // ==================== Confluence API Helpers ====================
+
+// Get all child pages of a given page (returns array of { id, title })
+async function getPageChildren(pageId) {
+  const response = await window.electronAPI.confluenceApiRequest({
+    method: 'GET',
+    url: `${state.baseUrl}/wiki/rest/api/content/${pageId}/child/page?limit=200`
+  });
+  if (!response.ok) return [];
+  return (response.data.results || []).map(p => ({ id: p.id, title: p.title }));
+}
 
 // Resolve space key from parent page
 async function resolveSpaceKey(spaceKey, parentPageId) {
@@ -851,6 +1018,8 @@ async function createNewPage(title, content, spaceKey, parentPageId) {
   });
 
   if (!response.ok) {
+    // Log full response body to help diagnose errors
+    console.error(`[createNewPage] "${title}" failed with status ${response.status}:`, JSON.stringify(response.data, null, 2));
     // Detect "page already exists" error
     const errMsg = JSON.stringify(response.data).toLowerCase();
     if (errMsg.includes('already exists') || errMsg.includes('duplicate') || response.status === 409) {
@@ -1311,6 +1480,17 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+// Log an import error to the global error log
+function logImportError(channelName, pageTitle, operation, error) {
+  state.importErrorLog.push({
+    timestamp: new Date().toISOString(),
+    channelName,
+    pageTitle,
+    operation,
+    error: String(error)
+  });
 }
 
 // Update progress bar

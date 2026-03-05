@@ -162,11 +162,13 @@ ipcMain.handle('read-slack-files', async (event, folderPath) => {
       }
       
       if (channels.length > 0) {
+        const usersFilePath = fs.existsSync(path.join(folderPath, 'users.json')) ? path.join(folderPath, 'users.json') : null;
         return { 
           success: true, 
           mode: 'multi', 
           channels: channels,
-          folderName: path.basename(folderPath)
+          folderName: path.basename(folderPath),
+          usersFilePath
         };
       }
     }
@@ -174,13 +176,21 @@ ipcMain.handle('read-slack-files', async (event, folderPath) => {
     // Fallback: check for date JSON files directly (single channel mode)
     const dateNames = scanChannelFolder(folderPath);
     if (dateNames.length > 0) {
+      // For single-channel, check parent folder for users.json
+      const parentDir = path.dirname(folderPath);
+      const usersFilePath = fs.existsSync(path.join(folderPath, 'users.json'))
+        ? path.join(folderPath, 'users.json')
+        : fs.existsSync(path.join(parentDir, 'users.json'))
+          ? path.join(parentDir, 'users.json')
+          : null;
       return { 
         success: true, 
         mode: 'single', 
         folderPath: folderPath,
         fileCount: dateNames.length,
         dateNames: dateNames,
-        folderName: path.basename(folderPath) 
+        folderName: path.basename(folderPath),
+        usersFilePath
       };
     }
     
@@ -234,10 +244,12 @@ ipcMain.handle('open-confluence-login', async (event, confluenceUrl) => {
         loginDetected = true;
         console.log('Login detected! URL:', url);
         
-        // Get cookies for API calls
+        // Guard against window being destroyed before async operations complete
+        if (!confluenceWindow || confluenceWindow.isDestroyed()) return;
         const cookies = await confluenceWindow.webContents.session.cookies.get({});
         
-        // Notify main window that login is complete
+        // Guard against main window being closed before we can notify it
+        if (!mainWindow || mainWindow.isDestroyed()) return;
         mainWindow.webContents.send('confluence-login-complete', {
           baseUrl: new URL(url).origin,
           cookies: cookies
@@ -300,6 +312,10 @@ ipcMain.handle('confluence-api-request', async (event, { method, url, body }) =>
       console.log('Making API request to:', url);
       console.log('Method:', method);
       console.log('Cookies count:', cookies.length);
+      if (body && method === 'POST') {
+        const bodyStr = JSON.stringify(body);
+        console.log('POST body (first 2000 chars):', bodyStr.substring(0, 2000));
+      }
       
       const request = net.request({
         method: method || 'GET',
@@ -327,12 +343,18 @@ ipcMain.handle('confluence-api-request', async (event, { method, url, body }) =>
         response.on('end', () => {
           try {
             const jsonData = JSON.parse(responseData);
+            if (response.statusCode < 200 || response.statusCode >= 300) {
+              console.log('Response body (error):', JSON.stringify(jsonData, null, 2));
+            }
             resolve({
               ok: response.statusCode >= 200 && response.statusCode < 300,
               status: response.statusCode,
               data: jsonData
             });
           } catch (e) {
+            if (response.statusCode < 200 || response.statusCode >= 300) {
+              console.log('Response body (raw error):', responseData);
+            }
             resolve({
               ok: response.statusCode >= 200 && response.statusCode < 300,
               status: response.statusCode,
