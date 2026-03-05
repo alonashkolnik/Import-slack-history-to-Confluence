@@ -824,13 +824,21 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
   // Set link (useful for single-channel mode)
   elements.pageLink.href = channelPage.pageUrl;
 
+  // DECISION: If channel has <10 files, import all content into single parent page (no monthly subpages)
+  // BUT: if the channel already has monthly subpages, continue using them for consistency
+  const existingChildren = await getPageChildren(channelPageId);
+  const hasMonthlySubpages = existingChildren.length > 0;
+
+  if (slackData.length < 10 && !hasMonthlySubpages) {
+    return await importChannelSinglePage(channelName, slackData, spaceKeyResolved, channelPageId, channelPage.pageUrl, channelPage.version, progressStart, progressEnd);
+  }
+
   // Create monthly child pages
   let createdCount = 0;
   let skippedCount = 0;
   let elsewhereCount = 0;
 
-  // Pre-fetch existing children page IDs for correct nav link URLs
-  const existingChildren = await getPageChildren(channelPageId);
+  // Use already-fetched existingChildren for nav link URLs
   const monthPageIds = new Map(existingChildren.map(c => [c.title, c.id]));
   const pageVersions = new Map(); // title → last known version after first pass
   const newlyCreatedTitles = new Set();
@@ -942,6 +950,79 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
     summary += `, ${elsewhereCount} skipped (exist elsewhere in space)`;
   }
   return { summary };
+}
+
+// Import a channel as a single page (no monthly subpages) — for channels with <10 files
+// Supports incremental updates
+async function importChannelSinglePage(channelName, slackData, spaceKeyResolved, channelPageId, channelPageUrl, currentVersion, progressStart, progressEnd) {
+  updateProgress(Math.round(progressStart), `${channelName}: importing ${slackData.length} days into single page...`);
+  updateChannelStatus(channelName, 'in-progress', `Importing ${slackData.length} days...`);
+
+  // Fetch the latest page state to get current version and existing content
+  const existingPage = await getPageById(channelPageId);
+  let existingDates = new Set();
+  let version = existingPage ? existingPage.version : currentVersion;
+
+  if (existingPage && existingPage.content) {
+    existingDates = extractExistingDates(existingPage.content);
+  }
+
+  // Build incremental content (only new dates)
+  const { html: newContent, newDatesCount } = buildIncrementalContent(slackData, existingDates);
+
+  if (newDatesCount === 0) {
+    updateProgress(Math.round(progressEnd), `${channelName}: up to date`);
+    return { summary: `${slackData.length} days already imported, 0 new` };
+  }
+
+  // Build full page content: header + children macro + all messages
+  let fullContent = `<h1>Slack Channel: ${escapeHtml(channelName)}</h1>\n`;
+  fullContent += `<p><em>Imported on ${new Date().toLocaleString()}</em></p>\n`;
+  fullContent += '<ac:structured-macro ac:name="children"><ac:parameter ac:name="sort">title</ac:parameter></ac:structured-macro>\n';
+
+  // Append all existing content (rebuild from slackData to maintain order)
+  for (const dayData of slackData) {
+    fullContent += `<h2>📅 ${escapeHtml(dayData.dateName)}</h2>\n`;
+    fullContent += '<hr/>\n';
+
+    const messages = dayData.messages;
+    const threads = new Map();
+    const mainMessages = [];
+
+    for (const msg of messages) {
+      if (msg.thread_ts && msg.thread_ts !== msg.ts) {
+        if (!threads.has(msg.thread_ts)) {
+          threads.set(msg.thread_ts, []);
+        }
+        threads.get(msg.thread_ts).push(msg);
+      } else {
+        mainMessages.push(msg);
+      }
+    }
+
+    for (const msg of mainMessages) {
+      fullContent += renderMessage(msg);
+
+      if (msg.ts && threads.has(msg.ts)) {
+        const replies = threads.get(msg.ts);
+        fullContent += `<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">💬 Thread replies (${replies.length})</ac:parameter><ac:rich-text-body>\n`;
+        for (const reply of replies) {
+          fullContent += renderMessage(reply, true);
+        }
+        fullContent += '</ac:rich-text-body></ac:structured-macro>\n';
+      }
+    }
+  }
+
+  // Update the page with full content
+  const updateResult = await updatePageContent(channelPageId, channelName, fullContent, version);
+  if (!updateResult.success) {
+    logImportError(channelName, channelName, 'update single-page', updateResult.error);
+    throw new Error(`Failed to update page: ${updateResult.error}`);
+  }
+
+  updateProgress(Math.round(progressEnd), `${channelName}: ${newDatesCount} new days imported`);
+  return { summary: `${slackData.length} days imported (single page), ${newDatesCount} new` };
 }
 
 // Check if navigation links need updating (e.g., a new month was added)
@@ -1295,6 +1376,31 @@ function formatSlackText(text) {
   formatted = formatted.replace(/\n/g, '<br/>');
   
   return formatted;
+}
+
+// Get page by ID with content and version
+async function getPageById(pageId) {
+  try {
+    const url = `${state.baseUrl}/wiki/rest/api/content/${pageId}?expand=body.storage,version`;
+    const response = await window.electronAPI.confluenceApiRequest({
+      method: 'GET',
+      url: url
+    });
+    
+    if (!response.ok) {
+      console.log('Failed to get page by ID:', response);
+      return null;
+    }
+    
+    return {
+      id: response.data.id,
+      version: response.data.version?.number || 1,
+      content: response.data.body?.storage?.value || ''
+    };
+  } catch (error) {
+    console.error('Error getting page by ID:', error);
+    return null;
+  }
 }
 
 // Check if a page with the given title exists under the parent
