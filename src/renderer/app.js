@@ -465,6 +465,7 @@ async function importChannelMonthlyPagesInto(channelName, slackData, spaceKey, c
   const monthsMap = groupByMonth(slackData);
   const monthKeys = Array.from(monthsMap.keys());
   const totalMonths = monthKeys.length;
+  const channelAnalysis = buildThreadMapAcrossDays(slackData);
 
   let createdCount = 0;
   let skippedCount = 0;
@@ -492,7 +493,7 @@ async function importChannelMonthlyPagesInto(channelName, slackData, spaceKey, c
     const prevUrl = prevId ? `${baseUrl}/wiki/spaces/${spaceKey}/pages/${prevId}` : null;
     const nextUrl = nextId ? `${baseUrl}/wiki/spaces/${spaceKey}/pages/${nextId}` : null;
 
-    const monthContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+    const monthContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel, channelAnalysis);
 
     const existingMonthPage = await findExistingPage(monthTitle, spaceKey, channelPageId);
 
@@ -500,20 +501,21 @@ async function importChannelMonthlyPagesInto(channelName, slackData, spaceKey, c
       monthPageIds.set(monthTitle, existingMonthPage.id);
       const existingDates = extractExistingDates(existingMonthPage.content);
       const { newDatesCount } = buildIncrementalContent(monthData, existingDates);
+      const forceRebuild = monthHasCrossDateThreads(monthData, channelAnalysis);
 
-      if (newDatesCount === 0) {
+      if (newDatesCount === 0 && !forceRebuild) {
         skippedCount++;
         pageVersions.set(monthTitle, existingMonthPage.version);
         const needsNavUpdate = checkNavLinksNeedUpdate(existingMonthPage.content, channelName, prevMonthKey, nextMonthKey);
         if (needsNavUpdate) {
-          const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+          const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel, channelAnalysis);
           await updatePageContent(existingMonthPage.id, monthTitle, updatedContent, existingMonthPage.version);
           pageVersions.set(monthTitle, existingMonthPage.version + 1);
         }
         continue;
       }
 
-      const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+      const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel, channelAnalysis);
       const updateResult = await updatePageContent(existingMonthPage.id, monthTitle, updatedContent, existingMonthPage.version);
       if (updateResult.success) {
         createdCount++;
@@ -558,7 +560,7 @@ async function importChannelMonthlyPagesInto(channelName, slackData, spaceKey, c
     const nextUrl = nextId ? `${baseUrl}/wiki/spaces/${spaceKey}/pages/${nextId}` : null;
 
     const monthData = monthsMap.get(monthKey);
-    const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+    const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel, channelAnalysis);
     const navUpdateResult = await updatePageContent(currentPageId, currentTitle, updatedContent, currentVersion);
     if (!navUpdateResult.success) {
       logImportError(channelName, currentTitle, 'update next-link', navUpdateResult.error);
@@ -600,6 +602,100 @@ function buildMonthlyPageTitle(channelName, monthKey) {
   return `${channelName} - ${formatMonthLabel(monthKey)}`;
 }
 
+// Build a channel-wide (or arbitrary scope) thread analysis.
+// Lets thread replies attach to their parent regardless of which day or month they live in.
+//   threads: thread_ts -> [replies sorted by ts]
+//   parentTsSet: ts values of all messages that act as thread parents (non-reply messages)
+//   parentDateByTs: ts -> dateName of the parent message
+//   replyDatesByThreadTs: thread_ts -> Set of dateNames where replies appear
+function buildThreadMapAcrossDays(daysData) {
+  const threads = new Map();
+  const parentTsSet = new Set();
+  const parentDateByTs = new Map();
+  const replyDatesByThreadTs = new Map();
+
+  for (const dayData of daysData) {
+    for (const msg of dayData.messages) {
+      if (msg.thread_ts && msg.thread_ts !== msg.ts) {
+        if (!threads.has(msg.thread_ts)) {
+          threads.set(msg.thread_ts, []);
+        }
+        threads.get(msg.thread_ts).push(msg);
+        if (!replyDatesByThreadTs.has(msg.thread_ts)) {
+          replyDatesByThreadTs.set(msg.thread_ts, new Set());
+        }
+        replyDatesByThreadTs.get(msg.thread_ts).add(dayData.dateName);
+      } else if (msg.ts) {
+        parentTsSet.add(msg.ts);
+        parentDateByTs.set(msg.ts, dayData.dateName);
+      }
+    }
+  }
+  for (const replies of threads.values()) {
+    replies.sort((a, b) => parseFloat(a.ts || '0') - parseFloat(b.ts || '0'));
+  }
+  return { threads, parentTsSet, parentDateByTs, replyDatesByThreadTs };
+}
+
+// True if any thread parent in `monthData` has replies on different dates anywhere in the channel,
+// or if any reply in `monthData` has a parent on a different date anywhere in the channel.
+// Used to force a re-import rebuild for pages saved before the cross-day/month thread fix.
+function monthHasCrossDateThreads(monthData, channelAnalysis) {
+  const { parentDateByTs, replyDatesByThreadTs } = channelAnalysis;
+  for (const dayData of monthData) {
+    for (const msg of dayData.messages) {
+      if (msg.thread_ts && msg.thread_ts !== msg.ts) {
+        const parentDate = parentDateByTs.get(msg.thread_ts);
+        if (parentDate && parentDate !== dayData.dateName) return true;
+      } else if (msg.ts) {
+        const replyDates = replyDatesByThreadTs.get(msg.ts);
+        if (replyDates) {
+          for (const rd of replyDates) {
+            if (rd !== dayData.dateName) return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// Render a thread block (expand macro) for a parent message's replies.
+function renderThreadBlock(replies) {
+  let html = `<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">💬 Thread replies (${replies.length})</ac:parameter><ac:rich-text-body>\n`;
+  for (const reply of replies) {
+    html += renderMessage(reply, true);
+  }
+  html += '</ac:rich-text-body></ac:structured-macro>\n';
+  return html;
+}
+
+// Render one day's messages using a thread map shared across days.
+// Replies whose parent lives in the same scope (parentTsSet) are rendered under that parent,
+// not as standalone messages on the reply's own date.
+function renderDayMessages(messages, threads, parentTsSet) {
+  let html = '';
+  for (const msg of messages) {
+    const isReply = msg.thread_ts && msg.thread_ts !== msg.ts;
+
+    if (isReply) {
+      if (parentTsSet.has(msg.thread_ts)) {
+        // Parent is in this scope — will be rendered under parent's thread block
+        continue;
+      }
+      // Orphan: parent is outside this scope (different month, or missing). Render standalone.
+      html += renderMessage(msg, true);
+      continue;
+    }
+
+    html += renderMessage(msg);
+    if (msg.ts && threads.has(msg.ts)) {
+      html += renderThreadBlock(threads.get(msg.ts));
+    }
+  }
+  return html;
+}
+
 // Build channel parent page content
 function buildChannelParentContent(channelName) {
   let html = `<h1>Slack Channel: ${escapeHtml(channelName)}</h1>\n`;
@@ -636,44 +732,22 @@ function buildNavLinks(prevUrl, prevLabel, nextUrl, nextLabel) {
 // Build content for a single monthly page
 // prevUrl/nextUrl: full Confluence page URLs (or null if page doesn't exist yet)
 // prevLabel/nextLabel: human-readable month labels (or null)
-function buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel) {
+function buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel, channelAnalysis) {
   let html = `<h1>${escapeHtml(channelName)} - ${escapeHtml(formatMonthLabel(monthKey))}</h1>\n`;
   html += `<p><em>Imported on ${new Date().toLocaleString()}</em></p>\n`;
 
   // Navigation at top
   html += buildNavLinks(prevUrl, prevLabel, nextUrl, nextLabel);
 
+  // Use channel-wide analysis if provided; threads spanning months attach to their parent's month page.
+  // Falls back to per-month scope if caller didn't pass one.
+  const analysis = channelAnalysis || buildThreadMapAcrossDays(monthData);
+  const { threads, parentTsSet } = analysis;
+
   for (const dayData of monthData) {
     html += `<h2>📅 ${escapeHtml(dayData.dateName)}</h2>\n`;
     html += '<hr/>\n';
-
-    const messages = dayData.messages;
-    const threads = new Map();
-    const mainMessages = [];
-
-    for (const msg of messages) {
-      if (msg.thread_ts && msg.thread_ts !== msg.ts) {
-        if (!threads.has(msg.thread_ts)) {
-          threads.set(msg.thread_ts, []);
-        }
-        threads.get(msg.thread_ts).push(msg);
-      } else {
-        mainMessages.push(msg);
-      }
-    }
-
-    for (const msg of mainMessages) {
-      html += renderMessage(msg);
-
-      if (msg.ts && threads.has(msg.ts)) {
-        const replies = threads.get(msg.ts);
-        html += `<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">💬 Thread replies (${replies.length})</ac:parameter><ac:rich-text-body>\n`;
-        for (const reply of replies) {
-          html += renderMessage(reply, true);
-        }
-        html += '</ac:rich-text-body></ac:structured-macro>\n';
-      }
-    }
+    html += renderDayMessages(dayData.messages, threads, parentTsSet);
   }
 
   // Navigation at bottom
@@ -801,6 +875,8 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
   const monthsMap = groupByMonth(slackData);
   const monthKeys = Array.from(monthsMap.keys()); // sorted
   const totalMonths = monthKeys.length;
+  // Channel-wide thread analysis: cross-month replies nest under their parent's month page.
+  const channelAnalysis = buildThreadMapAcrossDays(slackData);
 
   // Create or find the channel parent page
   const channelParentContent = buildChannelParentContent(channelName);
@@ -863,7 +939,7 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
     const prevUrl = prevId ? `${baseUrl}/wiki/spaces/${spaceKeyResolved}/pages/${prevId}` : null;
     const nextUrl = nextId ? `${baseUrl}/wiki/spaces/${spaceKeyResolved}/pages/${nextId}` : null;
 
-    const monthContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+    const monthContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel, channelAnalysis);
 
     // Check if monthly page already exists under channel parent
     const existingMonthPage = await findExistingPage(monthTitle, spaceKeyResolved, channelPageId);
@@ -873,15 +949,18 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
       // Page is a subpage — safe to update
       const existingDates = extractExistingDates(existingMonthPage.content);
       const { html: newContent, newDatesCount } = buildIncrementalContent(monthData, existingDates);
+      // Force rebuild on re-import if any thread in this month spans dates (within-month or cross-month) —
+      // pages saved before the fix may be missing reply continuations that lived in a different file.
+      const forceRebuild = monthHasCrossDateThreads(monthData, channelAnalysis);
 
-      if (newDatesCount === 0) {
+      if (newDatesCount === 0 && !forceRebuild) {
         skippedCount++;
         pageVersions.set(monthTitle, existingMonthPage.version);
 
         // Still update nav links if neighbors changed
         const needsNavUpdate = checkNavLinksNeedUpdate(existingMonthPage.content, channelName, prevMonthKey, nextMonthKey);
         if (needsNavUpdate) {
-          const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+          const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel, channelAnalysis);
           await updatePageContent(existingMonthPage.id, monthTitle, updatedContent, existingMonthPage.version);
           pageVersions.set(monthTitle, existingMonthPage.version + 1);
         }
@@ -889,7 +968,7 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
       }
 
       // Rebuild the full monthly page with all dates
-      const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+      const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel, channelAnalysis);
       const updateResult = await updatePageContent(existingMonthPage.id, monthTitle, updatedContent, existingMonthPage.version);
       if (updateResult.success) {
         createdCount++;
@@ -938,7 +1017,7 @@ async function importChannelWithMonthlyPages(channelName, slackData, spaceKeyRes
     const nextUrl = nextId ? `${baseUrl}/wiki/spaces/${spaceKeyResolved}/pages/${nextId}` : null;
 
     const monthData = monthsMap.get(monthKey);
-    const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel);
+    const updatedContent = buildMonthlyPageContent(channelName, monthKey, monthData, prevUrl, prevLabel, nextUrl, nextLabel, channelAnalysis);
     const navUpdateResult = await updatePageContent(currentPageId, currentTitle, updatedContent, currentVersion);
     if (!navUpdateResult.success) {
       logImportError(channelName, currentTitle, 'update next-link', navUpdateResult.error);
@@ -969,8 +1048,12 @@ async function importChannelSinglePage(channelName, slackData, spaceKeyResolved,
 
   // Build incremental content (only new dates)
   const { html: newContent, newDatesCount } = buildIncrementalContent(slackData, existingDates);
+  // Force rebuild on re-import if any thread in this channel spans dates — pages saved before
+  // the fix may be missing reply continuations that lived in a different day's file.
+  const channelAnalysis = buildThreadMapAcrossDays(slackData);
+  const forceRebuild = monthHasCrossDateThreads(slackData, channelAnalysis);
 
-  if (newDatesCount === 0) {
+  if (newDatesCount === 0 && !forceRebuild) {
     updateProgress(Math.round(progressEnd), `${channelName}: up to date`);
     return { summary: `${slackData.length} days already imported, 0 new` };
   }
@@ -980,38 +1063,14 @@ async function importChannelSinglePage(channelName, slackData, spaceKeyResolved,
   fullContent += `<p><em>Imported on ${new Date().toLocaleString()}</em></p>\n`;
   fullContent += '<ac:structured-macro ac:name="children"><ac:parameter ac:name="sort">title</ac:parameter></ac:structured-macro>\n';
 
+  // Thread map across the entire channel — keeps cross-day and cross-month threads intact.
+  const { threads, parentTsSet } = channelAnalysis;
+
   // Append all existing content (rebuild from slackData to maintain order)
   for (const dayData of slackData) {
     fullContent += `<h2>📅 ${escapeHtml(dayData.dateName)}</h2>\n`;
     fullContent += '<hr/>\n';
-
-    const messages = dayData.messages;
-    const threads = new Map();
-    const mainMessages = [];
-
-    for (const msg of messages) {
-      if (msg.thread_ts && msg.thread_ts !== msg.ts) {
-        if (!threads.has(msg.thread_ts)) {
-          threads.set(msg.thread_ts, []);
-        }
-        threads.get(msg.thread_ts).push(msg);
-      } else {
-        mainMessages.push(msg);
-      }
-    }
-
-    for (const msg of mainMessages) {
-      fullContent += renderMessage(msg);
-
-      if (msg.ts && threads.has(msg.ts)) {
-        const replies = threads.get(msg.ts);
-        fullContent += `<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">💬 Thread replies (${replies.length})</ac:parameter><ac:rich-text-body>\n`;
-        for (const reply of replies) {
-          fullContent += renderMessage(reply, true);
-        }
-        fullContent += '</ac:rich-text-body></ac:structured-macro>\n';
-      }
-    }
+    fullContent += renderDayMessages(dayData.messages, threads, parentTsSet);
   }
 
   // Update the page with full content
@@ -1470,52 +1529,22 @@ function extractExistingDates(htmlContent) {
 function buildIncrementalContent(slackData, existingDates) {
   let html = '';
   let newDatesCount = 0;
-  
+
+  // Build thread map across the entire provided data so cross-day threads stay intact.
+  const { threads, parentTsSet } = buildThreadMapAcrossDays(slackData);
+
   for (const dayData of slackData) {
     // Skip if this date already exists
     if (existingDates.has(dayData.dateName)) {
       console.log('Skipping existing date:', dayData.dateName);
       continue;
     }
-    
+
     newDatesCount++;
-    
-    // Add date header
+
     html += `<h2>📅 ${escapeHtml(dayData.dateName)}</h2>\n`;
     html += '<hr/>\n';
-
-    // Process messages for this day
-    const messages = dayData.messages;
-    
-    // Group messages by thread
-    const threads = new Map();
-    const mainMessages = [];
-
-    for (const msg of messages) {
-      if (msg.thread_ts && msg.thread_ts !== msg.ts) {
-        if (!threads.has(msg.thread_ts)) {
-          threads.set(msg.thread_ts, []);
-        }
-        threads.get(msg.thread_ts).push(msg);
-      } else {
-        mainMessages.push(msg);
-      }
-    }
-
-    // Render messages
-    for (const msg of mainMessages) {
-      html += renderMessage(msg);
-
-      // Render thread replies if any
-      if (msg.ts && threads.has(msg.ts)) {
-        const replies = threads.get(msg.ts);
-        html += `<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">💬 Thread replies (${replies.length})</ac:parameter><ac:rich-text-body>\n`;
-        for (const reply of replies) {
-          html += renderMessage(reply, true);
-        }
-        html += '</ac:rich-text-body></ac:structured-macro>\n';
-      }
-    }
+    html += renderDayMessages(dayData.messages, threads, parentTsSet);
   }
 
   return { html, newDatesCount };
