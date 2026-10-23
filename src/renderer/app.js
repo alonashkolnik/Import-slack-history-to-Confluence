@@ -1404,7 +1404,15 @@ function formatSlackText(text) {
   if (!text) return '';
   
   let formatted = escapeHtml(text);
-  
+
+  // Links: <url|text> or <url> (already escaped to &lt;…&gt;). Swap them for
+  // placeholders so the bold/italic rules below can't mangle the URLs.
+  const links = [];
+  formatted = formatted.replace(/&lt;(https?:\/\/(?:(?!&gt;)[^|])+?)(?:\|((?:(?!&gt;).)+?))?&gt;/g, (match, url, label) => {
+    links.push(`<a href="${url}">${label || url}</a>`);
+    return `\u0000${links.length - 1}\u0000`;
+  });
+
   // Bold: *text*
   formatted = formatted.replace(/\*([^*]+)\*/g, '<strong>$1</strong>');
   
@@ -1416,10 +1424,6 @@ function formatSlackText(text) {
   
   // Code: `text`
   formatted = formatted.replace(/`([^`]+)`/g, '<code>$1</code>');
-  
-  // Links: <url|text> or <url>
-  formatted = formatted.replace(/<(https?:\/\/[^|>]+)\|([^>]+)>/g, '<a href="$1">$2</a>');
-  formatted = formatted.replace(/<(https?:\/\/[^>]+)>/g, '<a href="$1">$1</a>');
   
   // User mentions: <@U12345> or &lt;@U12345&gt; (after escapeHtml)
   formatted = formatted.replace(/&lt;@(U[A-Z0-9]+)&gt;/g, (match, userId) => {
@@ -1433,7 +1437,9 @@ function formatSlackText(text) {
   
   // Newlines
   formatted = formatted.replace(/\n/g, '<br/>');
-  
+
+  formatted = formatted.replace(/\u0000(\d+)\u0000/g, (match, i) => links[i]);
+
   return formatted;
 }
 

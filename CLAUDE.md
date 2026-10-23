@@ -16,7 +16,7 @@ npm run build:linux # Build Linux AppImage
 npm run build      # Build for all platforms
 ```
 
-There are no linter, formatter, or test framework commands — the project has zero runtime dependencies and no testing infrastructure.
+`npm test` runs the Playwright suite: it launches the real app against a mock Confluence Cloud (`test/helpers/mock-confluence.js`) with generated Slack exports (`test/helpers/slack-export.js`). Set `ELECTRON_APP_EXE` to run it against a packaged build. There is no linter or formatter; the project has zero runtime dependencies.
 
 ## Architecture
 
@@ -77,7 +77,7 @@ The renderer converts Slack's message format to Confluence storage format (XHTML
 ## Important Context
 
 - **No TypeScript** — vanilla JavaScript throughout; no tsconfig, no webpack, no babel
-- **No test suite** — manual testing only
+- **Tests** — `npm test` (Playwright, drives the real Electron app; see Commands)
 - **IPC security** — renderer has no direct file system or network access; all privileged operations go through `preload.js` → `main.js`
 - **Electron `net` module** — used for Confluence API requests (not `fetch`/`axios`) so session cookies from the embedded login window are automatically included
 - **`users.json`** — optional 1.5 MB Slack workspace export file mapping user IDs to display names; auto-detected if present in the export folder root

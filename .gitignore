@@ -6,3 +6,7 @@ Thumbs.db
 
 # Private Slack export data — do not commit
 myPrivateChannels/
+
+# Playwright test output
+test-results/
+playwright-report/

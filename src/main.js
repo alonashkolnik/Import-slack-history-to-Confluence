@@ -330,17 +330,20 @@ ipcMain.handle('confluence-api-request', async (event, { method, url, body }) =>
         request.setHeader('Content-Type', 'application/json');
       }
 
-      let responseData = '';
+      // Collect raw bytes and decode once: decoding chunk by chunk corrupts
+      // multi-byte UTF-8 characters that straddle a chunk boundary
+      const chunks = [];
 
       request.on('response', (response) => {
         console.log('Response status:', response.statusCode);
         console.log('Response headers:', response.headers);
-        
+
         response.on('data', (chunk) => {
-          responseData += chunk.toString();
+          chunks.push(chunk);
         });
 
         response.on('end', () => {
+          const responseData = Buffer.concat(chunks).toString('utf-8');
           try {
             const jsonData = JSON.parse(responseData);
             if (response.statusCode < 200 || response.statusCode >= 300) {

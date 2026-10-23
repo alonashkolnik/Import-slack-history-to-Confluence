@@ -10,7 +10,8 @@
     "build:win": "electron-builder --win",
     "build:mac": "electron-builder --mac",
     "build:linux": "electron-builder --linux",
-    "pack": "electron-packager . \"Slack History Import\" --platform=win32 --arch=x64 --out=dist --overwrite"
+    "pack": "electron-packager . \"Slack History Import\" --platform=win32 --arch=x64 --out=dist --overwrite",
+    "test": "playwright test"
   },
   "build": {
     "appId": "com.slackhistory.import",
@@ -59,7 +60,8 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^27.0.0",
+    "@playwright/test": "^1.64.1",
+    "electron": "^44.9.3",
     "electron-builder": "^24.9.1",
     "electron-packager": "^17.1.2"
   }
