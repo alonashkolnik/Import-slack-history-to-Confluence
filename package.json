@@ -1,6 +1,6 @@
 {
   "name": "slack-history-import",
-  "version": "2.0.4",
+  "version": "3.0.0",
   "description": "Desktop application to import Slack channel history to Confluence",
   "main": "src/main.js",
   "scripts": {
